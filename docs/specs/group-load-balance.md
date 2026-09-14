@@ -9,6 +9,15 @@ URLTest/Fallback/Selector.
 Related gap-analysis row: §proxy-groups "load-balance — enum variant
 exists, no group impl".
 
+> **Implementation status (2026-09, issue #485):** load-balance groups now join
+> the same periodic health-check sweep as `url-test`/`fallback`.
+> `meow_config::extract_health_check_specs` emits a `HealthCheckSpec` for a
+> `load-balance` group, so its members are probed against `url` every
+> `interval` seconds (default 300, `0` disables); `lazy: true` defers probing
+> until the group next carries traffic. The `url`, `interval`, and `lazy`
+> fields are therefore effective. `use:` / `include-all` provider members are
+> still not supported on load-balance and emit a parse-time warning (#555).
+
 ## Motivation
 
 `type: load-balance` is the fourth proxy group type after Selector,
@@ -67,20 +76,20 @@ proxy-groups:
       - proxy-b
       - proxy-c
     url: https://www.gstatic.com/generate_204
-    interval: 300          # health-check sweep interval, seconds
+    interval: 300          # health-check sweep interval in seconds
     strategy: round-robin  # round-robin (default) | consistent-hashing
-    lazy: false            # if true, defer first health-check until first use
+    lazy: false            # defer the sweep until the group carries traffic
 ```
 
 Field reference:
 
 | Field | Type | Required | Default | Meaning |
 |-------|------|:-------:|---------|---------|
-| `proxies` | `[]string` | yes | — | Named proxies or groups to balance across. Same resolution as Selector. |
-| `url` | string | no | `https://www.gstatic.com/generate_204` | Health-check probe URL. |
-| `interval` | integer | no | `300` | Health-check sweep interval in seconds. `0` = no background sweep; group still skips proxies known dead from other groups' sweeps. |
+| `proxies` | `[]string` | yes | — | Named proxies or groups to balance across. Same resolution as Selector for static names; `use:` / `include-all` provider members are not supported yet (warned at parse time, see divergence 6). |
+| `url` | string | no | `https://www.gstatic.com/generate_204` | Health-check probe URL. Members are probed against it by the periodic sweep. |
+| `interval` | integer | no | `300` | Health-check sweep interval in seconds. Each member is probed every `interval` seconds; a member whose probe fails is skipped by both strategies until it recovers. `0` disables the periodic sweep (upstream `HealthCheck.auto()`). |
 | `strategy` | enum | no | `round-robin` | Selection strategy. |
-| `lazy` | bool | no | `false` | If true, defer first health-check probe until the group's first connection attempt. |
+| `lazy` | bool | no | `false` | When `true`, the periodic sweep is deferred until the group next carries traffic (same as `url-test`/`fallback`). Upstream defaults to `true`; see divergence 5. |
 
 **Divergences from upstream** (classified per
 [ADR-0002](../adr/0002-upstream-divergence-policy.md)):
@@ -91,6 +100,8 @@ Field reference:
 | 2 | `strategy: consistent-hashing` with no alive proxies — upstream panics (index out of bounds) | A | We return `MeowError::NoProxyAvailable` and surface it as a clean dial error. NOT a panic. |
 | 3 | All proxies dead — upstream returns the round-robin slot (dead proxy) | B | We return `NoProxyAvailable` error immediately instead of dialing a known-dead proxy. Same reachability outcome (connection fails), but our failure is fast and named. |
 | 4 | `strategy: consistent-hashing` uses modulo-hash, not ring-hash | B | Despite the name, upstream Go mihomo's implementation (`adapter/outbound/loadbalance.go`) uses the same `hash % alive.len()` modulo approach, not a ring. Rebalancing a proxy list reshuffles most assignments — users expecting minimal-disruption ring-consistent-hash should be aware. We match upstream; the label "consistent-hashing" means "stable for a given src IP given a fixed proxy list", not ring-consistent. |
+| 5 | `lazy` defaults to `false` — upstream defaults to `true` (`GroupCommonOption{Lazy: true}`, `adapter/outboundgroup/parser.go`) | B | Pre-existing default shared with `url-test`/`fallback`; an unset `lazy` probes eagerly instead of only while the group carries traffic. Subscription-compatible either way; only background probe volume differs. Tracked in #555. |
+| 6 | `use:` / `include-all` on load-balance — upstream resolves provider members | B | `LoadBalanceGroup` has no provider slots yet, so provider members are dropped when the group is built. We warn and balance only the static `proxies:` members. The non-empty guard counts provider slots, so a `use:`-only group whose provider exists still parses and builds with zero members (every dial returns `NoProxyAvailable`, the sweep logs `0/0 alive`); the warning is the only signal. Only a group with neither static members nor a resolvable provider is rejected. Tracked in #555. |
 
 ## Internal design
 
@@ -175,18 +186,29 @@ comment; do not optimize now.
 
 ### Health-check integration
 
-`LoadBalanceGroup` uses the same health-check infrastructure as
-`UrlTestGroup`:
+`LoadBalanceGroup` participates in the same periodic health-check sweep as
+`url-test`/`fallback`, driven by the `HealthCheckSupervisor` in
+`crates/meow-tunnel/src/health_check.rs`:
 
-- Has a `url: String` and `interval: Duration` config.
-- Background sweep task (spawned by `main.rs`) calls `p.touch_url(url)` on
-  each proxy, which updates `p.alive()` and `p.last_delay()`.
-- The group's `select()` reads `p.alive()` — no additional locking
-  needed; `alive()` is already thread-safe on `ProxyHealth`.
-
-Engineer: copy the spawn pattern from `UrlTestGroup` in `main.rs`.
-The sweep task does not need to be inside the group struct — it just
-needs `Arc<LoadBalanceGroup>` to call `update_health()`.
+- `meow_config::extract_health_check_specs` reads the raw group config and
+  emits a `HealthCheckSpec` (`group_name`, `url`, `interval_secs`, `lazy`)
+  for every `load-balance` group, using the shared defaults (`url` →
+  `https://www.gstatic.com/generate_204`, `interval` → 300 s, `lazy` →
+  false); `interval: 0` emits no spec. The supervisor reconciles the spec
+  set on every config commit, so groups added or removed at runtime are
+  picked up.
+- The per-group task ticks every `interval` seconds. Each tick resolves the
+  group's `members()` to their `Arc<dyn Proxy>` and probes them via
+  `meow_proxy::health::probe_many_bounded(members, &spec.url, …)`, which
+  records each result into that member's shared `ProxyHealth`
+  (`record_delay`; `alive = delay > 0`).
+- `select()` reads `p.alive()` on each member — no extra locking; the sweep
+  and the group hold the same `Arc<dyn Proxy>`, so a recorded probe result is
+  immediately visible to selection.
+- `lazy: true` gates probing on `usage_generation()`: `LoadBalanceGroup` bumps
+  a `UsageTracker` on every user dial (`dial_tcp` / `dial_udp` /
+  `unwrap_proxy`), and the loop skips ticks until the generation advances, so
+  an idle lazy group is not probed.
 
 ### `dial_tcp` / `dial_udp`
 

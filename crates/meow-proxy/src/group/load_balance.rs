@@ -8,6 +8,8 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use super::UsageTracker;
+
 #[derive(Debug)]
 pub enum LbStrategy {
     RoundRobin,
@@ -20,6 +22,7 @@ pub struct LoadBalanceGroup {
     strategy: LbStrategy,
     counter: AtomicUsize,
     health: ProxyHealth,
+    usage: UsageTracker,
 }
 
 impl LoadBalanceGroup {
@@ -30,6 +33,7 @@ impl LoadBalanceGroup {
             strategy,
             counter: AtomicUsize::new(0),
             health: ProxyHealth::new(),
+            usage: UsageTracker::new(),
         }
     }
 
@@ -167,11 +171,13 @@ impl ProxyAdapter for LoadBalanceGroup {
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
+        self.usage.touch_user_traffic(metadata);
         let proxy = self.select(metadata).ok_or(MeowError::NoProxyAvailable)?;
         proxy.dial_tcp(metadata).await
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+        self.usage.touch_user_traffic(metadata);
         let proxy = self
             .select_udp(metadata)
             .ok_or(MeowError::NoProxyAvailable)?;
@@ -179,6 +185,7 @@ impl ProxyAdapter for LoadBalanceGroup {
     }
 
     fn unwrap_proxy(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
+        self.usage.touch_user_traffic(metadata);
         self.select(metadata)
     }
 
@@ -234,6 +241,10 @@ impl Proxy for LoadBalanceGroup {
             .iter()
             .find(|p| p.alive())
             .map(|p| p.name().to_string())
+    }
+
+    fn usage_generation(&self) -> u64 {
+        self.usage.generation()
     }
 }
 
@@ -448,6 +459,7 @@ mod tests {
             strategy: LbStrategy::RoundRobin,
             counter: AtomicUsize::new(usize::MAX - 1),
             health: ProxyHealth::new(),
+            usage: super::UsageTracker::new(),
         };
         let meta = meta_no_src();
         // Should not panic; indices are (usize::MAX-1)%4 and (usize::MAX)%4
@@ -737,5 +749,38 @@ mod tests {
     fn group_addr_returns_empty() {
         let group = make_rr(vec![MockProxy::new("X")]);
         assert_eq!(group.addr(), "");
+    }
+
+    // ─── H. Lazy health-check / usage tracking ────────────────────────────────
+
+    #[tokio::test]
+    async fn dial_records_group_use_for_lazy_probe() {
+        // #485: a lazy load-balance group is only probed after a dial bumps the
+        // usage generation (health_check.rs::should_probe). Mirrors
+        // fallback.rs::dial_tcp_routes_through_first_alive.
+        let group = make_rr(vec![MockProxy::new("A")]);
+        assert_eq!(group.usage_generation(), 0, "unused group has no use");
+        let _ = group.dial_tcp(&meta_no_src()).await;
+        assert_eq!(group.usage_generation(), 1, "dial records group use");
+    }
+
+    #[tokio::test]
+    async fn health_probe_dials_do_not_count_as_use() {
+        // Sweep probes dial members with `ConnType::Tunnel`; if that bumped the
+        // usage generation a lazy group would keep itself awake forever.
+        // Mirrors fallback.rs::health_probe_dials_do_not_count_as_use.
+        let group = make_rr(vec![MockProxy::new("A")]);
+        let probe_meta = Metadata {
+            conn_type: ConnType::Tunnel,
+            ..meta_no_src()
+        };
+        let _ = group.dial_tcp(&probe_meta).await;
+        assert_eq!(
+            group.usage_generation(),
+            0,
+            "probe dials must not mark the group as used"
+        );
+        let _ = group.dial_tcp(&meta_no_src()).await;
+        assert_eq!(group.usage_generation(), 1, "real traffic still marks use");
     }
 }

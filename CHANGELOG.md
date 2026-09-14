@@ -86,6 +86,20 @@ the canonical, in-repo source a release is cut from.
   (e.g. `header: {X: 123}`) were previously coerced to `"123"` on API-pushed
   configs and are now rejected, matching mihomo.
 
+- **`load-balance` groups are now health-checked, so `url`, `interval`, and
+  `lazy` take effect.** A `load-balance` group accepted these fields but never
+  ran a health check, so it could keep routing to a dead member. It now joins
+  the same periodic sweep as `url-test`/`fallback`: members are probed every
+  `interval` seconds (default 300; `0` disables the sweep) against `url`
+  (default `https://www.gstatic.com/generate_204`), and `lazy: true` defers
+  probing until the group next carries traffic. Two known divergences from
+  mihomo remain and are tracked in #555: `lazy` still defaults to `false`
+  (upstream `true`, shared with `url-test`/`fallback`), and `select`/`relay`
+  members are still not swept. A `load-balance` group with `use:` or
+  `include-all` now logs a warning that provider members are ignored; a
+  provider-only group still parses but ends up with no members, so the
+  warning is the signal to look for. See #485.
+
 - Hysteria2 authentication no longer advertises HTTP/3 datagrams, preventing
   the server's HTTP/3 receiver from consuming raw QUIC UDP relay packets.
   The TProxy test image now includes the mandatory BoringSSL build toolchain.
