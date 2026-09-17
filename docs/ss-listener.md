@@ -148,9 +148,18 @@ the TUN stack). The flow table is capped at the listener's
 caps): each flow holds a 64 KiB reply buffer, a task, and an outbound
 socket, so without a cap any password holder could exhaust memory/FDs
 between idle sweeps. Datagrams for existing flows always pass; only *new*
-flows are dropped (with a warn) while the table is saturated. As with
-SOCKS5-UDP, port-53 traffic bypasses rule matching to DIRECT (avoiding
-looping client DNS back through a proxy / the in-process resolver).
+flows are dropped (with a warn) while the table is saturated. Client UDP —
+including port 53 — follows the configured routing policy (a `REJECT` rule
+still applies; there is no port-53 DIRECT bypass).
+
+For AEAD-2022 ciphers a second table maps `client_session_id` → relay
+session (random server session ID, session-wide reply packet counter, and
+the §3.2.4 client packet-ID replay window). It shares the same
+`max-connections` bound — unseen session IDs are dropped at capacity while
+known ones always pass — and each session is retained for at least 60 s
+after its last datagram (the spec's "remembered for at least 60 seconds"
+floor, measured independently of flow liveness so an early-dead flow cannot
+take the replay window down inside the 30 s header-timestamp tolerance).
 
 ## Feature gating
 
