@@ -1,6 +1,15 @@
 # Spec: Relay proxy group (M1.C-2)
 
 Status: Approved (architect 2026-04-11, unblocked once M1.B-1 VMess lands `connect_over` trait change)
+Post-M1 update: issue #570 extended `connect_over` to the full TCP outbound
+set — vless, vmess, trojan, anytls, shadowsocks (built-in plugins only),
+plus the existing direct/reject/http/socks5/snell. `connect_over` now means
+"run the adapter's complete post-connect pipeline (its own transport/TLS
+stack + protocol handshake) over the supplied stream" — mihomo's
+`DialContextWithDialer` model. Hysteria2 stays first-hop-only (QUIC cannot
+ride a TCP stream); SS external SIP003 plugins fail loudly since the
+subprocess owns its outbound leg; mux pooling is bypassed on relay-supplied
+streams (single-use, nothing to pool).
 Owner: pm
 Tracks roadmap item: **M1.C-2**
 Depends on: none beyond the existing `ProxyAdapter` trait.
@@ -35,10 +44,11 @@ In scope:
 
 1. `RelayGroup` struct in `crates/meow-proxy/src/group/relay.rs`
    implementing `ProxyAdapter`.
-2. TCP relay through a chain of ≥2 proxies. Each intermediate hop
-   is connected via its predecessor using `ProxyAdapter::dial_tcp`
-   with the *next hop's address* as the `Metadata` target — not the
-   final target. The final hop dials the actual target.
+2. TCP relay through a chain of ≥2 proxies. Hop 0 dials via
+   `ProxyAdapter::dial_tcp` with the *next hop's address* as the
+   `Metadata` target — not the final target. Every subsequent hop runs
+   `ProxyAdapter::connect_over` over the stream its predecessor
+   established; the final hop receives the actual target.
 3. UDP relay through a relay chain when all proxies in the chain
    support UDP and the final hop supports UDP. Returns `UdpNotSupported`
    if any chain member lacks UDP support.
@@ -62,9 +72,19 @@ Out of scope:
   references — this matches upstream.
 - **WARP-over-WARP or protocol-specific relay modes.** We relay at
   the `ProxyConn` abstraction layer; protocol internals are opaque.
-- **Relay of relay (nested relay groups).** Permitted but not
-  explicitly tested — if proxy[0] is itself a relay group, the chain
-  nests correctly via `dial_tcp` delegation. Document in a comment.
+- **Relay of relay (nested relay groups).** Supported and tested —
+  a `RelayGroup` appearing at any chain position is flattened into the
+  outer chain by `flatten_hops` (`relay.rs`): its resolved members are
+  spliced in place so the preceding hop dials the inner chain's entry
+  point and each inner member runs `connect_over` in order. A
+  `DialerProxyAdapter` whose inner proxy is a `RelayGroup` is likewise
+  spliced — the enclosing chain already establishes the path, so the
+  per-outbound dialer is not applied again — *except* when the member
+  lands at the chain's global first hop, where the wrapper is kept so
+  its own `dial_tcp` still applies the configured front dialer.
+  Expansion is capped at `MAX_FLATTEN_DEPTH` (16) — deeper nesting
+  fails the dial outright rather than retaining an unexpanded group
+  mid-chain.
 
 ## Non-goals
 
@@ -72,6 +92,17 @@ Out of scope:
   existing `ProxyAdapter` implementations — no new wire format.
 - Exposing partial chain results if an intermediate hop fails.
   The entire chain fails as a unit with the offending hop's error.
+- Mux/session pooling across relay-supplied streams. A relay leg is a
+  single-use stream — there is nothing to pool against, so mux-enabled
+  adapters bypass their session layer at non-first hops. For a *fixed*
+  chain that must keep mux pooling, prefer a `dialer-proxy` front on the
+  last hop — for adapters that accept an injected `TcpDialer`
+  (vless/vmess/trojan/ss) the mux layer pools sessions above the
+  injected dialer, matching mihomo's model. This does not extend to
+  `anytls` or `hysteria2`: they cannot carry an injected dialer, so
+  `dialer-proxy` falls back to the same relay wrapper — anytls sessions
+  stay unpooled per connection and hysteria2 fails loudly at dial time.
+  `type: relay` is for ad hoc multi-hop.
 
 ## User-facing config
 
@@ -125,21 +156,23 @@ The relay chain must be established inside-out:
 To relay [A, B, C] → target:
 
 1. dial_tcp(A, dest={B.server:B.port})     → conn_to_A
-2. via conn_to_A: dial_tcp(B, dest={C.server:C.port})  → conn_to_B_via_A
-3. via conn_to_B_via_A: dial_tcp(C, dest=target)        → conn_to_C_via_A_via_B
+2. via conn_to_A: connect_over(B, dest={C.server:C.port})  → conn_to_B_via_A
+3. via conn_to_B_via_A: connect_over(C, dest=target)        → conn_to_C_via_A_via_B
 4. return conn_to_C_via_A_via_B (the stream the caller writes payload to)
 ```
 
 Step 1 establishes a real TCP connection to proxy A. Steps 2 and 3
 are proxy-level `CONNECT`-style tunnels through the already-established
-stream — each `dial_tcp` call is given the next proxy's address as
-the target, causing it to send a proxy-protocol header (VMess/VLESS/
-Shadowsocks/etc.) that tells proxy A to forward to proxy B, and then
-proxy B to forward to the real target.
+stream — implemented as `connect_over` calls (the adapter's full
+post-connect pipeline: its own transport/TLS stack plus the protocol
+handshake), each given the next proxy's address as the target, causing
+it to send a proxy-protocol header (VMess/VLESS/Shadowsocks/etc.) that
+tells proxy A to forward to proxy B, and then proxy B to forward to the
+real target.
 
-This works because every `ProxyAdapter::dial_tcp` takes an arbitrary
-`Metadata` target and establishes a proxied connection to that target
-over whatever stream is provided. The relay implementation provides the
+This works because `connect_over` takes an arbitrary `Metadata` target
+and establishes a proxied connection to that target over whatever
+stream is provided. The relay implementation provides the
 *prior-hop's established stream* as the underlying connection, passing
 proxy addresses as the target metadata.
 
@@ -162,17 +195,18 @@ protocol header + framing, without dialing a fresh TCP socket. The
 relay chain calls `dial_tcp` on the first proxy (establishes a real
 TCP connection), then `connect_over` on each subsequent hop.
 
-**Required method — no default impl.** Do NOT provide a default
-implementation that falls back to `dial_tcp`. A silent default would
-let adapters that forget to override appear to work in unit tests while
-failing relay in production. Every adapter author must consciously
-implement `connect_over`. The compiler enforces this.
+**Default impl — `Err(NotSupported)`.** The shipped implementation
+provides a default returning `Err(NotSupported)` so adapters compile
+without an override; adapters that cannot run over a supplied stream
+(hysteria2's QUIC, SS external SIP003 plugins) keep it deliberately.
+(The original spec asked for a required method — see Resolved
+questions §1.)
 
 **Special cases:**
 - `DirectAdapter::connect_over` — returns the passed stream unchanged.
   A direct hop in a relay chain is a no-op (useful for
   `relay: [direct, ss-node]`).
-- `RejectAdapter::connect_over` — returns `Err(MeowError::Rejected)`.
+- `RejectAdapter::connect_over` — returns `Err(MeowError::Proxy("rejected"))`.
 
 **Breaking change scope:** this trait change touches every
 `ProxyAdapter` impl (Direct, Reject, Shadowsocks, Trojan, and M1.B
@@ -188,16 +222,19 @@ async fn relay_tcp(
     proxies: &[Arc<dyn Proxy>],
     final_target: &Metadata,
 ) -> Result<Box<dyn ProxyConn>> {
-    debug_assert!(proxies.len() >= 2, "relay chain validated at parse time");
+    // Splice nested RelayGroup / dialer-proxy-wrapped relay members in
+    // place; resolve group members once; hard-error past depth 16.
+    let proxies = flatten_hops(proxies, final_target)?;
 
-    // proxy[0]: real TCP connect, target = proxy[1]'s server:port
-    let mut meta = metadata_for_proxy(&proxies[1]);
-    let mut conn: Box<dyn ProxyConn> = proxies[0].dial_tcp(&meta).await
-        .map_err(|e| MeowError::relay_hop_failed(0, e))?;
+    // proxy[0]: real TCP connect, target = the next non-DIRECT,
+    // non-empty-addr member's server:port (or final_target if none).
+    let mut conn: Box<dyn ProxyConn> =
+        proxies[0].dial_tcp(&metadata_for_next_hop(&proxies, 1, final_target)).await
+            .map_err(|e| MeowError::relay_hop_failed(0, e))?;
 
     // proxy[1..N-2]: connect_over the previous hop's established stream
     for i in 1..proxies.len() - 1 {
-        meta = metadata_for_proxy(&proxies[i + 1]);
+        let meta = metadata_for_next_hop(&proxies, i + 1, final_target);
         conn = proxies[i].connect_over(conn, &meta).await
             .map_err(|e| MeowError::relay_hop_failed(i, e))?;
     }
@@ -210,11 +247,21 @@ async fn relay_tcp(
 }
 ```
 
-**Nested relay groups** (relay-of-relay) work transparently:
-`RelayGroup` itself implements `ProxyAdapter`, so its `connect_over`
-runs the inner chain starting from the passed stream as the base
-connection. No special casing needed. This is confirmed correct by
-architect.
+**Nested relay groups** (relay-of-relay): a nested `RelayGroup` at any
+position is flattened by `flatten_hops` — the outer chain splices the
+inner group's resolved members in place, so the preceding hop dials the
+inner chain's entry point (its first non-DIRECT member's server) and
+each inner member runs `connect_over` normally. A `DialerProxyAdapter`
+whose inner proxy resolves to a `RelayGroup` is spliced the same way at
+any non-first position — inside an existing chain the path is already
+established, so the dialer-proxy wrapper contributes only its inner
+group's members (at hop 0 the wrapper is kept so its own `dial_tcp`
+still fires the configured front dialer). Expansion recurses and fails
+hard past `MAX_FLATTEN_DEPTH` = 16. A member that is not `DIRECT` and
+has no dialable `addr()` (REJECT, an unresolvable group) is terminal:
+flattening fails the dial with `RelayHopFailed` at that member's
+flattened index *before* any hop performs network I/O — the preceding
+hop is never told to open a real connection past it.
 
 ### Struct
 
@@ -256,7 +303,8 @@ Intermediate hop failures surface wrapped in `MeowError::RelayHopFailed`:
 MeowError::RelayHopFailed { hop: usize, source: Box<MeowError> }
 ```
 
-Error message shape: `"relay chain failed at hop 1 (proxy-b → proxy-c): <inner error>"`.
+Error message shape: `"relay chain failed at hop {hop}: {source}"`
+(`RelayHopFailed`'s `Display`; hop is the flattened chain index).
 
 Add `RelayHopFailed` to `MeowError` in `meow-common`. Do NOT use
 `anyhow::Context::context()` at the public boundary — `MeowError`
@@ -281,7 +329,8 @@ boundary.
    field. Class B per ADR-0002.
 9. `AdapterType::Relay` serialises to `"Relay"` in JSON.
 10. Group-reference in relay chain (e.g. a Selector as proxy[0])
-    resolves correctly at dial time via the Selector's `connect_over`.
+    resolves correctly at dial time via `unwrap_proxy` → leaf in
+    `resolve_proxy` (groups do not implement `connect_over`).
 11. Nested relay-of-relay (outer relay whose proxy[0] is itself a
     RelayGroup) delivers bytes to mock target without panicking.
 12. `MeowError::RelayHopFailed { hop, source }` is used at hop
@@ -333,14 +382,12 @@ boundary.
 
 ## Implementation checklist (for engineer handoff)
 
-**Sequencing (updated 2026-04-11):** `ProxyAdapter::connect_over` is
-implemented in M1.B-3/B-4 (HTTP CONNECT + SOCKS5) — coded and reviewed,
-pending push to main. Direct/Reject/SS/Trojan get a default `Err(NotSupported)`;
-HTTP and SOCKS5 have full implementations.
-**Once M1.B-3/B-4 merges, M1.C-2 is unblocked and can run in parallel
-with VLESS.** VLESS must still add its own `connect_over` override before
-a relay chain can use a VLESS hop, but that does not block the relay group
-implementation or its tests (use SS/HTTP/Direct hops in tests instead).
+**Sequencing (updated post-#570):** `connect_over` has a default
+`Err(NotSupported)` impl and is now implemented by every TCP-capable
+adapter — direct, reject, http, socks5, snell, vless, vmess, trojan,
+shadowsocks (built-in transports), anytls. Hysteria2 stays first-hop
+only; SS external SIP003 plugins fail loudly. Mux pooling is bypassed
+on relay-supplied streams.
 
 - [ ] Add `AdapterType::Relay` to `meow-common/src/adapter_type.rs`.
 - [ ] Add `connect_over(&self, stream: Box<dyn ProxyConn>, meta: &Metadata) -> Result<Box<dyn ProxyConn>>`
@@ -366,7 +413,6 @@ implementation or its tests (use SS/HTTP/Direct hops in tests instead).
    `DirectAdapter` returns stream unchanged; `RejectAdapter` returns
    error; HTTP+SOCKS5 have full impls.
 
-2. **Relay-of-relay (nested relay groups)** — works transparently.
-   `RelayGroup` implements `ProxyAdapter`; its `connect_over` runs the
-   inner chain from the passed stream. No special casing. Add
+2. **Relay-of-relay (nested relay groups)** — works at any chain
+   position via `flatten_hops` member splicing (post-#570). Add
    `relay_nested_relay_group` test bullet.

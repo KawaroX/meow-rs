@@ -35,7 +35,8 @@
 //! - **As a relay hop**: when a dialer-proxy outbound itself appears inside a
 //!   `relay` chain, `connect_over` delegates to the inner adapter — the relay
 //!   chain already defines the path, so the per-outbound dialer is not applied a
-//!   second time.
+//!   second time. At the chain's *first* hop the wrapper is kept instead and
+//!   its own `dial_tcp` runs, so the configured front dialer still fires.
 
 use async_trait::async_trait;
 use meow_common::{
@@ -65,6 +66,12 @@ impl DialerProxyAdapter {
     /// Name of the front dialer proxy/group (for diagnostics/tests).
     pub fn dialer_name(&self) -> &str {
         self.dialer.name()
+    }
+
+    /// The wrapped outbound. Used by relay flattening to splice an inner
+    /// relay group's members into the outer chain.
+    pub(crate) fn inner(&self) -> &Arc<dyn Proxy> {
+        &self.inner
     }
 }
 
@@ -141,6 +148,12 @@ impl Proxy for DialerProxyAdapter {
 
     fn delay_history(&self) -> Vec<DelayHistory> {
         self.inner.delay_history()
+    }
+
+    /// Lets relay `flatten_hops` downcast the wrapper and reach an inner
+    /// `RelayGroup`'s members.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 
     fn members(&self) -> Option<Vec<String>> {
