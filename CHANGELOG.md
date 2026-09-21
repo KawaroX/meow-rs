@@ -71,6 +71,18 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **`RULE-SET` rules now see refreshed rule-provider content without a
+  config rebuild** (#553). The rule parser received a snapshot `Arc` of
+  each provider's set, so a periodic refresh or `PUT /providers/rules/{name}`
+  logged "refreshed: N rules" and bumped `updated_at` while live traffic
+  kept matching the startup payload until the next `PUT /configs` or
+  restart. `RuleProvider` now implements `RuleSet` by reading through its
+  lock, and the parser map (`rule_provider::live_ruleset_map`, replacing
+  `snapshot_ruleset_map`) hands rules the provider itself; the DNS
+  `nameserver-policy` `rule-set:` matcher reads through the same way
+  instead of cloning a snapshot per query. Providers rebuilt by a config
+  reload still bypass the API registry (#543 item 2).
+
 - **HTTP/2 transports (gRPC, h2, xhttp) and the h2mux multiplexer now
   advertise 4 MiB per-stream / 16 MiB per-connection receive windows.**
   Every client handshake used h2's defaults, so the download direction of a
