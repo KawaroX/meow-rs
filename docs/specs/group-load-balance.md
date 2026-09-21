@@ -16,13 +16,26 @@ exists, no group impl".
 > `interval` seconds (default 300, `0` disables); `lazy: true` defers probing
 > until the group next carries traffic. The `url`, `interval`, and `lazy`
 > fields are therefore effective. `use:` / `include-all` provider members are
-> still not supported on load-balance and emit a parse-time warning (#555).
+> supported (issue #533 item 3): they join the same pick space as static
+> `proxies:` members — statics first, then each provider slot in order — and
+> a provider refresh is visible to the next selection without rebuilding the
+> group. Note on liveness: the periodic sweep resolves members through
+> `member_proxies()` (issue #543), so provider members *are* probed and
+> revived by it — identical to url-test/fallback. The group's dial-failure
+> escalation (repeated member dial errors mark the member dead) is an
+> additional between-sweeps signal: it dead-marks faster than `interval`,
+> and a dead-marked member can still be revived by the next sweep tick, a
+> provider refresh, or the on-demand
+> `/providers/proxies/{name}/healthcheck` endpoint.
 
 ## Motivation
 
 `type: load-balance` is the fourth proxy group type after Selector,
-URLTest, and Fallback. Upstream Go mihomo supports two strategies:
-round-robin (default) and consistent-hashing (sticky by source IP).
+URLTest, and Fallback. Upstream Go mihomo supports three strategies:
+consistent-hashing (default; sticky by *destination* via `getKey` +
+`jumpHash`), round-robin, and sticky-sessions (LRU src+dst key). Our
+implementation supports round-robin (our default) and a src-IP-keyed
+consistent-hashing variant — see divergence rows 4, 10, 11.
 Real subscriptions use load-balance to distribute traffic across a
 set of identically-capable peers (e.g. three SS nodes on the same
 VPS network). Without it, users with load-balance groups in their
@@ -59,6 +72,9 @@ Out of scope:
 
 - **`smart` strategy** — upstream has a "smart" strategy that mixes
   latency-awareness with spreading; niche, underdocumented, defer.
+- **`strategy: sticky-sessions`** — a real upstream strategy (LRU-cached
+  src+dst key → `jumpHash` member, 10-minute TTL); unimplemented, rejected
+  at parse time. See divergence 11.
 - **`strategy: bandwidth-aware`** — not in upstream's mainline.
 - **Weighted load-balance** — upstream does not have weights; neither
   do we.
@@ -77,7 +93,7 @@ proxy-groups:
       - proxy-c
     url: https://www.gstatic.com/generate_204
     interval: 300          # health-check sweep interval in seconds
-    strategy: round-robin  # round-robin (default) | consistent-hashing
+    strategy: round-robin  # round-robin (our default; upstream: consistent-hashing) | consistent-hashing
     lazy: false            # defer the sweep until the group carries traffic
 ```
 
@@ -85,7 +101,7 @@ Field reference:
 
 | Field | Type | Required | Default | Meaning |
 |-------|------|:-------:|---------|---------|
-| `proxies` | `[]string` | yes | — | Named proxies or groups to balance across. Same resolution as Selector for static names; `use:` / `include-all` provider members are not supported yet (warned at parse time, see divergence 6). |
+| `proxies` | `[]string` | no* | — | Named proxies or groups to balance across. Same resolution as Selector for static names; `use:` / `include-all` provider members balance alongside them (statics first in rotation order). *Required only when neither `use:` nor `include-all` supplies members. |
 | `url` | string | no | `https://www.gstatic.com/generate_204` | Health-check probe URL. Members are probed against it by the periodic sweep. |
 | `interval` | integer | no | `300` | Health-check sweep interval in seconds. Each member is probed every `interval` seconds; a member whose probe fails is skipped by both strategies until it recovers. `0` disables the periodic sweep (upstream `HealthCheck.auto()`). |
 | `strategy` | enum | no | `round-robin` | Selection strategy. |
@@ -99,9 +115,14 @@ Field reference:
 | 1 | Unknown `strategy` value — upstream falls back to round-robin | A | Unknown strategy means the user may get different distribution behaviour than intended. Hard-error at parse time. |
 | 2 | `strategy: consistent-hashing` with no alive proxies — upstream panics (index out of bounds) | A | We return `MeowError::NoProxyAvailable` and surface it as a clean dial error. NOT a panic. |
 | 3 | All proxies dead — upstream returns the round-robin slot (dead proxy) | B | We return `NoProxyAvailable` error immediately instead of dialing a known-dead proxy. Same reachability outcome (connection fails), but our failure is fast and named. |
-| 4 | `strategy: consistent-hashing` uses modulo-hash, not ring-hash | B | Despite the name, upstream Go mihomo's implementation (`adapter/outbound/loadbalance.go`) uses the same `hash % alive.len()` modulo approach, not a ring. Rebalancing a proxy list reshuffles most assignments — users expecting minimal-disruption ring-consistent-hash should be aware. We match upstream; the label "consistent-hashing" means "stable for a given src IP given a fixed proxy list", not ring-consistent. |
+| 4 | `strategy: consistent-hashing` diverges from upstream on key, hash, and dead-member handling | B | Upstream mihomo (`adapter/outboundgroup/loadbalance.go`) hashes the *destination* (`getKey`: IP-literal host → host, domain → eTLD+1, else `DstIP`) with `utils.MapHash` + `jumpHash` over the **full** member list, retrying `key+1` up to 5× on dead members before a linear alive scan — i.e. "same *target* → same node" with minimal disruption on membership changes. We hash the *client* `src_ip` bytes with FNV-1a and take `hash % alive_count` over the **alive subset** — "same *client* → same node", but a membership change reshuffles most assignments (with provider slots, on every refresh). For a single-client deployment our variant pins all traffic to one member; upstream's still balances across destinations. Deliberate pre-existing divergence (Clash-Premium-style src affinity); noted here so the periodic-refresh reshuffle is not mistaken for a bug. |
 | 5 | `lazy` defaults to `false` — upstream defaults to `true` (`GroupCommonOption{Lazy: true}`, `adapter/outboundgroup/parser.go`) | B | Pre-existing default shared with `url-test`/`fallback`; an unset `lazy` probes eagerly instead of only while the group carries traffic. Subscription-compatible either way; only background probe volume differs. Tracked in #555. |
-| 6 | `use:` / `include-all` on load-balance — upstream resolves provider members | B | `LoadBalanceGroup` has no provider slots yet, so provider members are dropped when the group is built. We warn and balance only the static `proxies:` members. The non-empty guard counts provider slots, so a `use:`-only group whose provider exists still parses and builds with zero members (every dial returns `NoProxyAvailable`, the sweep logs `0/0 alive`); the warning is the only signal. Only a group with neither static members nor a resolvable provider is rejected. Tracked in #555. |
+| 6 | `expected-status:` on load-balance parses but is ignored — upstream honors it (`HealthCheckOption`) | B | `LoadBalanceGroup` does not store `expected_status`/`test_url` (unlike url-test/fallback's `with_runtime_options`), so the sweep probes with the default 2xx acceptance set. Pre-existing gap, amplified now that provider members balance here. Tracked in #555. |
+| 7 | Duplicate `use:` entries are deduped — upstream appends per entry, so `use: [A, A]` double-weights provider A | B | A duplicated provider name can only ever produce an identical member view (group `filter:`/`exclude-*` are group scalars), so double-wiring it is always a weighting accident, never intent. Static `proxies:` duplicates still double-weight, matching upstream. |
+| 8 | `include-all` pulls providers only; upstream's `include-all` also pulls statics (`include-all-providers` is the providers-only alias upstream) | B | Pre-existing shared group semantics — `include-all-proxies` already covers the all-statics case, so `include-all` here equals upstream's `include-all-providers`. Combined with `use:`, `include-all` wins and `use:` is ignored — same as upstream. |
+| 9 | `use:` on a `relay` group warns and is ignored — upstream relay ignores it silently | B | A relay is a fixed static chain; provider members have no place in it. |
+| 10 | Default `strategy` is `round-robin` — upstream defaults to `consistent-hashing` (`case "", "consistent-hashing"` in `NewLoadBalance`) | B | Pre-existing default. `round-robin` is the safer default for our src-IP-keyed hashing variant (see row 4: an unset strategy would otherwise pin one client to one node permanently). |
+| 11 | `strategy: sticky-sessions` is rejected — upstream supports it (LRU-cached src+dst key → jumpHash member) | B | Listed here instead of the unknown-strategy catch-all: it is a real upstream value, currently unimplemented. If needed, upstream's semantics are an LRU of `(src,dst) → member index` with a 10-minute TTL. |
 
 ## Internal design
 
@@ -116,11 +137,14 @@ pub enum LbStrategy {
 }
 
 pub struct LoadBalanceGroup {
-    name: String,
-    proxies: Vec<Arc<dyn Proxy>>,
+    name: SmolStr,
+    static_proxies: Vec<Arc<dyn Proxy>>,
+    provider_slots: Vec<ProviderSlot>,  // live `use:`/`include-all` members
     strategy: LbStrategy,
     counter: AtomicUsize,   // only used for round-robin
     health: ProxyHealth,
+    usage: UsageTracker,
+    dial_failures: DialFailureTracker,  // onDialFailed escalation
 }
 ```
 
@@ -136,53 +160,57 @@ load-balancer where exact fairness is not guaranteed anyway.
 
 ```rust
 impl LoadBalanceGroup {
-    fn select(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
-        let alive: Vec<_> = self.proxies.iter()
-            .filter(|p| p.alive())
-            .collect();
-        if alive.is_empty() {
+    // Two passes over statics + provider-slot members: count the eligible
+    // set, take the strategy index, clone the nth eligible member. No Vec
+    // is materialized on the dial path even with providers attached.
+    fn pick(&self, metadata: &Metadata, udp_only: bool) -> Option<Arc<dyn Proxy>> {
+        // Pass 1: count members where `alive() && (!udp_only || support_udp())`.
+        let alive_count = ...;
+        if alive_count == 0 {
             return None;
         }
         let idx = match self.strategy {
             LbStrategy::RoundRobin => {
-                self.counter.fetch_add(1, Ordering::Relaxed) % alive.len()
+                self.counter.fetch_add(1, Ordering::Relaxed) % alive_count
             }
             LbStrategy::ConsistentHashing => {
-                let hash = fnv1a(metadata.src_ip_bytes());
-                (hash as usize) % alive.len()
+                let (bytes, len) = src_ip_bytes(metadata); // -> ([u8; 16], usize)
+                (fnv1a(&bytes[..len]) as usize) % alive_count
             }
         };
-        Some(alive[idx].clone())
+        // Pass 2: clone the nth eligible member of the same walk.
+        ...
     }
 
-    fn src_ip_bytes(metadata: &Metadata) -> &[u8] {
+    fn src_ip_bytes(metadata: &Metadata) -> ([u8; 16], usize) {
         // Extract the raw bytes of src_addr's IP.
         // IPv4: 4 bytes. IPv6: 16 bytes. Both are valid hash inputs.
         // If src_addr is absent (local loopback test / API probe), hash 0.0.0.0
-        // (4 zero bytes). Every connectionwithout a src_addr hashes to the same
+        // (4 zero bytes). Every connection without a src_addr hashes to the same
         // proxy — deterministic, not random, not an error.
     }
 }
 ```
 
-**FNV-1a for consistent hashing** — upstream Go mihomo uses
-`fnv.New32()` (FNV-1 32-bit). We use FNV-1a 32-bit, which is
-slightly better distributed and the same speed; we match the Go
-implementation's input (raw IP bytes, not the `host:port` string).
-The difference in hash function is an acceptable minor divergence —
-consistent-hashing result is guaranteed to be *stable* for a given
-src IP, not *identical* to Go mihomo's result on the same input.
-This is Class B: routing is correct and sticky, just not bit-for-bit
-identical to the Go output.
+**FNV-1a over src IP for consistent hashing** — we hash the client's
+`src_ip` bytes with inline FNV-1a 32-bit and take `hash % alive_count`
+over the alive subset. Upstream instead hashes a *destination* key
+(`getKey`: IP host → host, domain → eTLD+1, else `DstIP`) with
+`utils.MapHash` (murmur3) and picks via `jumpHash` over the full list
+with re-hash retries on dead members. Both the key input and the hash
+scheme diverge (see divergence 4): our guarantee is "stable for a given
+src IP while membership is unchanged" — not upstream's minimal-disruption
+"same target → same node".
 
 **No dependency on a crate for FNV** — 8 lines of inline math. Do
-not add `fnv` crate for a 1-function use. Implement inline with a
-comment `// FNV-1a 32-bit, matching upstream adapter/outbound/loadbalance.go::jumpHash logic shape`.
+not add `fnv` crate for a 1-function use.
 
-**Alive-set Vec allocation** — `alive: Vec<_>` is rebuilt on every
-`select()` call. Fine at realistic proxy counts (N < 50). Add a
-`// TODO(perf M2): cache alive-set or use a pre-filtered index if profiling shows this hot`
-comment; do not optimize now.
+**Alive-set walk, no allocation** — `select()` walks statics then provider
+slot contents twice (count, then nth) instead of materializing a `Vec`,
+keeping the dial path allocation-free whether or not providers are
+attached (same shape as url-test's `pick_for_dial`). A member dying
+between the two passes can shift the pick or yield `None` for one dial —
+benign and self-correcting.
 
 ### Health-check integration
 
@@ -198,10 +226,12 @@ comment; do not optimize now.
   set on every config commit, so groups added or removed at runtime are
   picked up.
 - The per-group task ticks every `interval` seconds. Each tick resolves the
-  group's `members()` to their `Arc<dyn Proxy>` and probes them via
+  group's `member_proxies()` — statics and provider-slot members alike —
+  and probes them via
   `meow_proxy::health::probe_many_bounded(members, &spec.url, …)`, which
   records each result into that member's shared `ProxyHealth`
-  (`record_delay`; `alive = delay > 0`).
+  (`record_delay`; `alive = delay > 0`). Dial-failure escalation marks a
+  failing member dead between ticks; a successful sweep probe revives it.
 - `select()` reads `p.alive()` on each member — no extra locking; the sweep
   and the group hold the same `Arc<dyn Proxy>`, so a recorded probe result is
   immediately visible to selection.
@@ -222,17 +252,14 @@ impl ProxyAdapter for LoadBalanceGroup {
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
-        // Filter alive proxies that also support UDP
-        let alive_udp: Vec<_> = self.proxies.iter()
-            .filter(|p| p.alive() && p.support_udp())
-            .collect();
-        // Then apply strategy on this filtered set
+        // `pick(metadata, udp_only = true)` — same two-pass member walk with
+        // the eligibility predicate narrowed to `alive() && support_udp()`.
         // ... same hash/counter logic as dial_tcp
     }
 
     fn support_udp(&self) -> bool {
-        // true if any proxy in the group supports UDP
-        self.proxies.iter().any(|p| p.support_udp())
+        // true if any static or provider-slot member supports UDP
+        self.any_member(|p| p.support_udp())
     }
 }
 ```
@@ -308,9 +335,10 @@ that subset.
   round-robin selected.
 - `parse_load_balance_explicit_round_robin` — `strategy: round-robin`.
 - `parse_load_balance_consistent_hashing` — `strategy: consistent-hashing`.
-- `parse_load_balance_unknown_strategy_hard_errors` — `strategy: sticky`
-  → parse error. Class A per ADR-0002: NOT silent fallback to round-robin.
-  Upstream: falls back silently.
+- `parse_load_balance_unknown_strategy_hard_errors` — an unrecognised
+  `strategy:` value → parse error. Class A per ADR-0002: NOT silent
+  fallback to round-robin. (Upstream additionally *accepts*
+  `sticky-sessions` — unimplemented here, divergence 11.)
 
 **Integration:**
 
