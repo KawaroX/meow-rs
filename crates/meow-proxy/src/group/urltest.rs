@@ -292,9 +292,14 @@ impl ProxyAdapter for UrlTestGroup {
         attempt.finish(proxy.dial_udp(metadata).await)
     }
 
-    fn unwrap_proxy(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
-        self.usage.touch_user_traffic(metadata);
-        self.fastest_proxy()
+    fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
+        if touch {
+            self.usage.touch_user_traffic(metadata);
+        }
+        // upstream `Unwrap` → `fast(touch)`: `touch` gates only usage
+        // recording — the recompute and the `fastest` update happen on
+        // peeks too, so the probe can never disagree with the next dial.
+        self.pick_for_dial()
     }
 
     fn health(&self) -> &ProxyHealth {
@@ -414,6 +419,24 @@ mod tests {
             .collect();
         assert_eq!(names, g.member_names());
         assert_eq!(names, vec!["a", "b", "p1", "p2"]);
+    }
+
+    /// `unwrap_proxy(meta, touch)` — upstream `Unwrap`: the peek must not
+    /// record usage (lazy groups stay asleep on match probes) but must
+    /// still return the same member the next dial would pick.
+    #[test]
+    fn unwrap_peek_returns_pick_without_touching_usage() {
+        let g = UrlTestGroup::new("auto", vec![MockProxy::new("a"), MockProxy::new("b")], 150);
+        let meta = Metadata::default();
+        let peeked = g.unwrap_proxy(&meta, false).expect("peek yields a member");
+        assert_eq!(
+            peeked.name(),
+            g.pick_for_dial().unwrap().name(),
+            "peek must agree with the next pick"
+        );
+        assert_eq!(g.usage_generation(), 0, "touch=false must not record usage");
+        let _ = g.unwrap_proxy(&meta, true);
+        assert_eq!(g.usage_generation(), 1, "touch=true records the use");
     }
 
     fn pick(g: &UrlTestGroup) -> String {

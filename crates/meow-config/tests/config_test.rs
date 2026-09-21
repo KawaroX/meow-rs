@@ -14,7 +14,7 @@ mixed-port: 7890
     assert!(config.listeners.http_port.is_none());
     // Default mode is Rule
     assert_eq!(config.general.mode.to_string(), "rule");
-    // Built-in proxies: DIRECT, REJECT, REJECT-DROP
+    // Built-in proxies: DIRECT, REJECT, REJECT-DROP, COMPATIBLE, PASS, PASS-RULE
     assert!(config.proxies.contains_key("DIRECT"));
     assert!(config.proxies.contains_key("REJECT"));
     assert!(config.proxies.contains_key("REJECT-DROP"));
@@ -99,7 +99,7 @@ proxy-groups:
         .get("child")
         .expect("child group must replace the same-named leaf");
     let parent_member = parent
-        .unwrap_proxy(&meow_common::Metadata::default())
+        .unwrap_proxy(&meow_common::Metadata::default(), true)
         .expect("parent must select its child member");
 
     assert!(
@@ -1287,7 +1287,7 @@ rules:
         dst_port: 443,
         ..Default::default()
     };
-    let target = config.rules[0].match_and_resolve(&m, &helper);
+    let target = config.rules[0].match_and_resolve(&m, &helper, &|_: &str| true);
     assert_eq!(target, Some("Stream"));
 }
 
@@ -1312,10 +1312,12 @@ rules:
         ..Default::default()
     };
     // SUB-RULE with non-matching inner returns None.
-    assert!(config.rules[0].match_and_resolve(&m, &helper).is_none());
+    assert!(config.rules[0]
+        .match_and_resolve(&m, &helper, &|_: &str| true)
+        .is_none());
     // MATCH still wins.
     assert_eq!(
-        config.rules[1].match_and_resolve(&m, &helper),
+        config.rules[1].match_and_resolve(&m, &helper, &|_: &str| true),
         Some("DIRECT")
     );
 }

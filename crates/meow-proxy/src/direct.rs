@@ -9,6 +9,10 @@ use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 
 pub struct DirectAdapter {
+    /// `Direct` normally; `Compatible` for the built-in `COMPATIBLE`
+    /// adapter (upstream `outbound.NewCompatible()` — a `*Direct` with the
+    /// `C.Compatible` type tag, used as GLOBAL's default member).
+    adapter_type: AdapterType,
     routing_mark: Option<u32>,
     /// Optional internal DNS resolver. When set, `dial_tcp` resolves
     /// hostnames via this resolver instead of the OS resolver — this is
@@ -34,10 +38,22 @@ pub struct DirectAdapter {
 impl DirectAdapter {
     pub fn new() -> Self {
         Self {
+            adapter_type: AdapterType::Direct,
             routing_mark: None,
             resolver: None,
             connect_timeout: None,
             health: ProxyHealth::new(),
+        }
+    }
+
+    /// `COMPATIBLE` built-in — a direct dialer carrying the `Compatible`
+    /// type tag, like upstream `NewCompatible`. Receives the same
+    /// routing-mark/resolver/timeout options as `DIRECT` via the `with_*`
+    /// builders.
+    pub fn compatible() -> Self {
+        Self {
+            adapter_type: AdapterType::Compatible,
+            ..Self::new()
         }
     }
 
@@ -280,11 +296,14 @@ async fn connect_with_mark(
 #[async_trait]
 impl ProxyAdapter for DirectAdapter {
     fn name(&self) -> &str {
-        "DIRECT"
+        match self.adapter_type {
+            AdapterType::Compatible => "COMPATIBLE",
+            _ => "DIRECT",
+        }
     }
 
     fn adapter_type(&self) -> AdapterType {
-        AdapterType::Direct
+        self.adapter_type
     }
 
     fn addr(&self) -> &str {
@@ -422,6 +441,40 @@ mod tests {
             .expect("second resolved address should connect");
         let _ = accept.await.unwrap();
         drop(conn);
+    }
+
+    /// `COMPATIBLE` is a real direct dialer under the `Compatible` tag —
+    /// not a display alias. Prove it with a real loopback exchange.
+    #[tokio::test]
+    async fn compatible_dials_direct_tcp_and_udp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let echo = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 16];
+            let n = s.read(&mut buf).await.unwrap();
+            s.write_all(&buf[..n]).await.unwrap();
+        });
+
+        let adapter = DirectAdapter::compatible();
+        assert_eq!(adapter.adapter_type(), AdapterType::Compatible);
+        let mut conn = adapter
+            .dial_tcp(&tcp_metadata("127.0.0.1", port))
+            .await
+            .expect("COMPATIBLE must dial direct");
+        conn.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        conn.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        echo.await.unwrap();
+
+        let udp = adapter
+            .dial_udp(&udp_metadata(IpAddr::V4(Ipv4Addr::LOCALHOST)))
+            .await
+            .expect("COMPATIBLE must bind a UDP session");
+        assert!(udp.local_addr().unwrap().is_ipv4());
     }
 
     /// Regression for QUIC/HTTP3 direct: `dial_udp` must bind the reply socket

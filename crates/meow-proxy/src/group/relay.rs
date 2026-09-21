@@ -86,7 +86,7 @@ fn metadata_for_proxy(proxy: &Arc<dyn Proxy>) -> Metadata {
 /// so stateful selectors such as load-balance use the same member for both the
 /// preceding hop's target and their own `connect_over` call.
 fn resolve_proxy(mut proxy: Arc<dyn Proxy>, metadata: &Metadata) -> Arc<dyn Proxy> {
-    while let Some(selected) = proxy.unwrap_proxy(metadata) {
+    while let Some(selected) = proxy.unwrap_proxy(metadata, true) {
         if Arc::ptr_eq(&proxy, &selected) {
             break;
         }
@@ -191,8 +191,10 @@ fn flatten_hops_at(
             // not a transparent DIRECT hop and has no dialable address is
             // terminal — fail now rather than letting its black-hole
             // `dial_tcp` (e.g. REJECT-DROP's sleep) burn the dial timeout.
-            if resolved.adapter_type() != AdapterType::Direct
-                && resolved.addr().is_empty()
+            if !matches!(
+                resolved.adapter_type(),
+                AdapterType::Direct | AdapterType::Compatible
+            ) && resolved.addr().is_empty()
                 && resolved
                     .as_any()
                     .and_then(|a| a.downcast_ref::<DialerProxyAdapter>())
@@ -232,7 +234,11 @@ fn flatten_hops_at(
         // would skip it and hand the preceding hop the *next* real target —
         // `[entry, REJECT]` would make `entry` connect to the final
         // destination before the reject fires.  Fail before any I/O.
-        if peeled.adapter_type() != AdapterType::Direct && peeled.addr().is_empty() {
+        if !matches!(
+            peeled.adapter_type(),
+            AdapterType::Direct | AdapterType::Compatible
+        ) && peeled.addr().is_empty()
+        {
             return Err(undialable_hop_error(out.len(), &peeled));
         }
         out.push(resolved);
@@ -240,11 +246,13 @@ fn flatten_hops_at(
     Ok(())
 }
 
-/// Return the target for a hop, skipping later DIRECT hops because they are
-/// transparent no-ops inside an already-established relay stream.  Members
-/// with no dialable address (`addr() == ""`, e.g. REJECT or an unresolvable
-/// group) can no longer reach this point — `flatten_hops_at` rejects them
-/// before any hop performs I/O; the `!addr().is_empty()` predicate stays as
+/// Return the target for a hop, skipping later DIRECT/COMPATIBLE hops —
+/// they are transparent no-ops inside an already-established relay stream
+/// (upstream `relay.go` removes `C.Direct`/`C.Compatible` hops from the
+/// target chain the same way).  Members with no dialable address
+/// (`addr() == ""`, e.g. REJECT or an unresolvable group) can no longer
+/// reach this point — `flatten_hops_at` rejects them before any hop
+/// performs I/O; the `!addr().is_empty()` predicate stays as
 /// defence-in-depth should the invariant ever break.
 fn metadata_for_next_hop(
     proxies: &[Arc<dyn Proxy>],
@@ -253,7 +261,12 @@ fn metadata_for_next_hop(
 ) -> Metadata {
     proxies[start..]
         .iter()
-        .find(|proxy| proxy.adapter_type() != AdapterType::Direct && !proxy.addr().is_empty())
+        .find(|proxy| {
+            !matches!(
+                proxy.adapter_type(),
+                AdapterType::Direct | AdapterType::Compatible
+            ) && !proxy.addr().is_empty()
+        })
         .map_or_else(|| final_target.clone(), metadata_for_proxy)
 }
 
@@ -437,6 +450,14 @@ impl ProxyAdapter for RelayGroup {
 }
 
 impl Proxy for RelayGroup {
+    // Deliberately no `unwrap_proxy` override: a relay resolves its hops
+    // lazily per-dial (metadata may differ per connection), so a
+    // match-time peek cannot name "the" member. Upstream `Relay` likewise
+    // never overrode `Unwrap` — a PASS hop deep in a chain surfaces as a
+    // loud `RelayHopFailed` at dial (flattening rejects nop hops) rather
+    // than a silent rule skip. Match-time `unwraps_to(Pass)` therefore
+    // sees a relay group as opaque — the rule materializes and fails
+    // closed at dial.
     fn alive(&self) -> bool {
         self.health.alive()
     }
