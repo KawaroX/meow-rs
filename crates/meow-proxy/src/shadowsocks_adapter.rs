@@ -1,5 +1,6 @@
 #[cfg(feature = "ech-tls-tunnel")]
 use crate::ech_tls_tunnel::{self, EchTlsTunnelConfig};
+use crate::gost_plugin;
 use crate::v2ray_plugin::{self, V2rayPluginConfig};
 use async_trait::async_trait;
 use meow_common::atomic::{checked_increment, AtomicU};
@@ -41,6 +42,9 @@ pub enum BuiltinObfs {
 /// * `Obfs` — native simple-obfs codec wraps the TCP stream before SS encryption.
 /// * `V2ray` — native v2ray-plugin websocket (+ optional TLS) transport wraps
 ///   the TCP stream before SS encryption.
+/// * `Gost` — native gost-plugin websocket (+ optional TLS and single-stream
+///   smux) transport wraps the TCP stream before SS encryption.
+/// * `EchTlsTunnel` — `ech-tls-tunnel` plugin (TLS-in-TLS with ECH).
 #[allow(clippy::large_enum_variant)]
 enum PluginKind {
     None,
@@ -49,6 +53,14 @@ enum PluginKind {
     External(#[allow(dead_code)] Plugin),
     Obfs(BuiltinObfs),
     V2ray(V2rayPluginConfig, Option<TlsLayer>),
+    /// Native gost-plugin websocket (+ optional TLS and smux) transport.
+    /// `WsLayer` is built at construction so a malformed headers/path
+    /// config fails once at startup, not per dial.
+    Gost(
+        gost_plugin::GostPluginConfig,
+        Option<TlsLayer>,
+        meow_transport::ws::WsLayer,
+    ),
     #[cfg(feature = "ech-tls-tunnel")]
     EchTlsTunnel(EchTlsTunnelConfig, TlsLayer),
 }
@@ -113,6 +125,16 @@ impl ShadowsocksAdapter {
                 );
                 let tls = v2ray_plugin::build_tls_layer(&cfg)?;
                 PluginKind::V2ray(cfg, tls)
+            }
+            Some("gost-plugin") => {
+                let cfg = gost_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
+                debug!(
+                    "SS '{}' using built-in gost-plugin: tls={} host={} path={} mux={}",
+                    name, cfg.tls, cfg.host, cfg.path, cfg.mux
+                );
+                let tls = gost_plugin::build_tls_layer(&cfg)?;
+                let ws = gost_plugin::build_ws_layer(&cfg)?;
+                PluginKind::Gost(cfg, tls, ws)
             }
             #[cfg(feature = "ech-tls-tunnel")]
             Some("ech-tls-tunnel") => {
@@ -197,6 +219,26 @@ impl ShadowsocksAdapter {
         self.mux = Some(MuxClient::new(dial, options));
         self
     }
+
+    /// Whether the configured plugin transport can carry UDP. The ws-based
+    /// plugins are TCP-only (`dial_udp` refuses them); keep the advertised
+    /// `support_udp()` capability in sync so load-balance member filtering
+    /// and `GET /proxies` don't claim UDP for a node that cannot serve it.
+    fn plugin_supports_udp(&self) -> bool {
+        !matches!(
+            self.core.plugin,
+            PluginKind::V2ray(..) | PluginKind::Gost(..)
+        ) && {
+            #[cfg(feature = "ech-tls-tunnel")]
+            {
+                !matches!(self.core.plugin, PluginKind::EchTlsTunnel(..))
+            }
+            #[cfg(not(feature = "ech-tls-tunnel"))]
+            {
+                true
+            }
+        }
+    }
 }
 
 impl SsCore {
@@ -240,6 +282,24 @@ impl SsCore {
                 let transport =
                     v2ray_plugin::dial(cfg, tls.as_ref(), &self.server, self.port, &*self.dialer)
                         .await?;
+                let stream = ProxyClientStream::from_stream(
+                    Arc::clone(&self.context),
+                    transport,
+                    &self.server_config,
+                    addr,
+                );
+                Ok(Box::new(SsConn(stream)))
+            }
+            PluginKind::Gost(cfg, tls, ws) => {
+                let transport = gost_plugin::dial(
+                    cfg,
+                    tls.as_ref(),
+                    ws,
+                    &self.server,
+                    self.port,
+                    &*self.dialer,
+                )
+                .await?;
                 let stream = ProxyClientStream::from_stream(
                     Arc::clone(&self.context),
                     transport,
@@ -365,6 +425,17 @@ impl SsCore {
                     addr,
                 );
                 Ok(Box::new(SsConn(s)))
+            }
+            PluginKind::Gost(..) => {
+                // gost (ws+tls+smux) could terminate on a relay-supplied
+                // stream once it grows a `handshake_over` split — its `dial`
+                // currently owns the TCP dial itself. Until then, fail
+                // loudly rather than send unwrapped traffic.
+                Err(MeowError::NotSupported(
+                    "ss: gost-plugin transport does not yet support \
+                     terminating on a relay-supplied stream"
+                        .into(),
+                ))
             }
             PluginKind::External(_) => {
                 // A SIP003 subprocess owns its outbound leg (it dials the
@@ -766,7 +837,8 @@ impl ProxyAdapter for ShadowsocksAdapter {
         // enforcement point: `meow-tunnel`'s UDP path calls `dial_udp`
         // directly without consulting `support_udp`, so the refusal is
         // re-checked there.  Keep the two in sync.
-        let plain_udp_ok = self.support_udp && !self.core.dialer.is_proxy();
+        let plain_udp_ok =
+            self.support_udp && !self.core.dialer.is_proxy() && self.plugin_supports_udp();
         plain_udp_ok || {
             #[cfg(feature = "mux")]
             {
@@ -851,6 +923,11 @@ impl ProxyAdapter for ShadowsocksAdapter {
         if matches!(self.core.plugin, PluginKind::V2ray(..)) {
             return Err(MeowError::NotSupported(
                 "v2ray-plugin does not support UDP relay".into(),
+            ));
+        }
+        if matches!(self.core.plugin, PluginKind::Gost(..)) {
+            return Err(MeowError::NotSupported(
+                "gost-plugin does not support UDP relay".into(),
             ));
         }
         #[cfg(feature = "ech-tls-tunnel")]
@@ -1097,6 +1174,38 @@ mod tests {
         );
     }
 
+    /// gost-plugin is a TCP-only ws transport — `dial_udp` must refuse
+    /// loudly (`NotSupported` naming the plugin) and `support_udp()` must
+    /// agree, regardless of the `udp: true` config flag.
+    #[tokio::test]
+    async fn gost_plugin_refuses_udp() {
+        let adapter = ShadowsocksAdapter::new(
+            "ss-gost",
+            "127.0.0.1",
+            8388,
+            "password",
+            "aes-256-gcm",
+            true,
+            Some("gost-plugin"),
+            Some("mode=websocket;mux=false"),
+            Arc::new(crate::dialer::DirectDialer),
+        )
+        .expect("adapter builds");
+
+        match adapter.dial_udp(&Metadata::default()).await {
+            Err(MeowError::NotSupported(m)) => assert!(
+                m.contains("gost-plugin"),
+                "refusal should name the plugin, got: {m}"
+            ),
+            Err(other) => panic!("expected NotSupported, got: {other:?}"),
+            Ok(_) => panic!("gost-plugin must refuse UDP"),
+        }
+        assert!(
+            !adapter.support_udp(),
+            "advertised capability must agree with the refusal"
+        );
+    }
+
     /// SIP022 §3.2.2/§3.2.4: a client session mints a non-zero ID, counts
     /// packets up, and filters replies — echo match, replay drop, and
     /// server-session rotation resetting the window.
@@ -1241,6 +1350,7 @@ mod tests {
         assert!(is_builtin_obfs_plugin("obfs"));
         assert!(is_builtin_obfs_plugin("simple-obfs"));
         assert!(!is_builtin_obfs_plugin("v2ray-plugin"));
+        assert!(!is_builtin_obfs_plugin("gost-plugin"));
         assert!(!is_builtin_obfs_plugin("OBFS"));
         assert!(!is_builtin_obfs_plugin(""));
     }
