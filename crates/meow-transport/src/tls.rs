@@ -31,7 +31,7 @@
 //! `X509_VERIFY_PARAM_set1_ip` do the match.  Test case A9 asserts this.
 //!
 //! `sni = None` is never produced for a valid TLS connection; [`TlsLayer::new`]
-//! returns [`TransportError::Config`](crate::TransportError::Config) if it receives `None`.
+//! returns [`TransportError::Config`] if it receives `None`.
 //!
 //! # Connector sharing
 //!
@@ -45,7 +45,7 @@
 use async_trait::async_trait;
 use tracing::warn;
 
-use crate::{Result, Stream, Transport};
+use crate::{Result, Stream, Transport, TransportError};
 
 mod boring_backend;
 
@@ -99,6 +99,14 @@ pub struct TlsConfig {
     /// Disable server certificate verification.  Emits a `warn!` once.
     pub skip_cert_verify: bool,
 
+    /// Minimum negotiated TLS version (`None` = BoringSSL default).
+    /// ECH forces ≥ TLS 1.3 regardless (RFC 9180 §6).
+    pub min_version: Option<TlsVersion>,
+
+    /// Maximum negotiated TLS version (`None` = BoringSSL default).
+    /// Used by shadow-tls v1, which only speaks TLS 1.2 on the wire.
+    pub max_version: Option<TlsVersion>,
+
     /// Hostname the peer certificate is verified against when it differs
     /// from the connection SNI (mihomo's `name-cert-verify` / Go
     /// `VerifyPeerCertificate` name override).  `None` → verify against
@@ -129,6 +137,16 @@ pub struct TlsConfig {
     /// defaults.
     pub fingerprint: Option<String>,
 
+    /// Explicit supported-groups list override (BoringSSL
+    /// `set_curves_list` syntax, e.g. `"X25519:P-256:P-384"`).
+    /// `None` = BoringSSL default.  Applied after `fingerprint` shaping,
+    /// so it wins over the profile's own curve list — shadow-tls v2 uses
+    /// it to drop `X25519MLKEM768` when no fingerprint is shaping the
+    /// ClientHello anyway (a hybrid-PQ keyshare breaks v2 servers;
+    /// upstream parity with mihomo's `HelloChrome_Auto → HelloChrome_120`
+    /// swap).
+    pub curves_list: Option<String>,
+
     /// Extra CA certificates (DER-encoded) added to the root store in
     /// addition to `webpki-roots`.  Used in tests with self-signed certs;
     /// production deployments leave this empty.
@@ -157,15 +175,28 @@ impl TlsConfig {
             sni: Some(sni.into()),
             alpn: Vec::new(),
             skip_cert_verify: false,
+            min_version: None,
+            max_version: None,
             verify_name: None,
             cert_pin: None,
             client_cert: None,
             fingerprint: None,
+            curves_list: None,
             additional_roots: Vec::new(),
             ech: None,
             reality: None,
         }
     }
+}
+
+/// TLS protocol version bound for [`TlsConfig::min_version`] /
+/// [`TlsConfig::max_version`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsVersion {
+    /// TLS 1.2
+    Tls12,
+    /// TLS 1.3
+    Tls13,
 }
 
 /// Optional mutual-TLS client certificate (PEM-encoded key and certificate).
@@ -206,12 +237,12 @@ impl TlsLayer {
     ///
     /// # Errors
     ///
-    /// * [`TransportError::Config`](crate::TransportError::Config) — `sni` is `None`.
-    /// * [`TransportError::Config`](crate::TransportError::Config) — an ALPN id is empty or longer than 255 bytes.
-    /// * [`TransportError::Config`](crate::TransportError::Config) — `reality` is set without the `reality` feature.
-    /// * [`TransportError::Config`](crate::TransportError::Config) — a DER in `additional_roots` is malformed.
-    /// * [`TransportError::Config`](crate::TransportError::Config) — `client_cert` PEM is unparseable.
-    /// * [`TransportError::Tls`](crate::TransportError::Tls) — client cert + key don't match.
+    /// * [`TransportError::Config`] — `sni` is `None`.
+    /// * [`TransportError::Config`] — an ALPN id is empty or longer than 255 bytes.
+    /// * [`TransportError::Config`] — `reality` is set without the `reality` feature.
+    /// * [`TransportError::Config`] — a DER in `additional_roots` is malformed.
+    /// * [`TransportError::Config`] — `client_cert` PEM is unparseable.
+    /// * [`TransportError::Tls`] — client cert + key don't match.
     pub fn new(config: &TlsConfig) -> Result<Self> {
         #[cfg(not(feature = "reality"))]
         if config.reality.is_some() {
@@ -250,6 +281,67 @@ impl TlsLayer {
         Ok(Self {
             backend: TlsBackend::Boring(Box::new(LazyBoringInner::new(config.clone()))),
         })
+    }
+
+    /// Handshake over a caller-owned stream type, returning the concrete
+    /// `SslStream<S>` so the inner stream can be recovered afterwards via
+    /// `SslStream::get_mut` — used by shadow-tls, which discards the TLS
+    /// session once the cover handshake ends and continues on the raw
+    /// conn.  `inner` sees BoringSSL's flush pends as ordinary
+    /// `Pending`s (boring 5.x retries `BIO_CTRL_FLUSH` natively); a shim
+    /// `S` must still implement poll contracts itself.
+    ///
+    /// Handshake failures surface as [`ConnectTypedError::Handshake`],
+    /// which keeps the source stream recoverable (shadow-tls v3 treats a
+    /// specific late-handshake failure as the expected outcome — the
+    /// cover's Finished never verifies against the wire-patched
+    /// ClientHello transcript).
+    ///
+    /// REALITY backends reject this — there is no TLS session to discard.
+    pub async fn connect_typed<S>(&self, inner: S) -> TypedConnectResult<S>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        match &self.backend {
+            #[cfg(feature = "reality")]
+            TlsBackend::Reality(_) => {
+                Err(ConnectTypedError::Transport(crate::TransportError::Config(
+                    "connect_typed is not supported on the REALITY backend".into(),
+                )))
+            }
+            TlsBackend::Boring(lazy) => lazy.connect_typed(inner).await,
+        }
+    }
+}
+
+/// Result of [`TlsLayer::connect_typed`].
+pub type TypedConnectResult<S> =
+    std::result::Result<tokio_boring::SslStream<S>, ConnectTypedError<S>>;
+
+/// Failure of [`TlsLayer::connect_typed`].
+///
+/// Split into two classes because callers that wrap the handshake in a
+/// shim (shadow-tls) can still make use of the stream — and of the
+/// aborted `Ssl`'s state — after a handshake error, while a setup error
+/// never touched the wire.
+pub enum ConnectTypedError<S> {
+    /// Configuration/setup failed before the TLS handshake ran — nothing
+    /// was sent, no stream to recover.
+    Transport(TransportError),
+    /// The TLS handshake failed mid-flight.  `into_source_stream()`
+    /// recovers `S`; `ssl()` exposes the aborted session state (e.g.
+    /// `verify_result`).
+    Handshake(tokio_boring::HandshakeError<S>),
+}
+
+impl<S> ConnectTypedError<S> {
+    /// Collapse into a plain [`TransportError`], discarding any
+    /// recoverable stream — for callers that only want the error.
+    pub fn into_transport(self) -> TransportError {
+        match self {
+            Self::Transport(e) => e,
+            Self::Handshake(e) => TransportError::Tls(format!("boring TLS handshake: {e}")),
+        }
     }
 }
 
