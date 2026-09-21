@@ -4,7 +4,7 @@ mod orig_dest;
 use crate::sniffer::SnifferRuntime;
 use firewall::FirewallGuard;
 use meow_common::{with_dial_timeout, ConnType, Metadata, Network};
-use meow_tunnel::{copy_bidirectional_buf_tracked, Tunnel, RELAY_BUF_SIZE};
+use meow_tunnel::{copy_bidirectional_buf_tracked, ResolvedTarget, Tunnel, RELAY_BUF_SIZE};
 use smallvec::smallvec;
 use std::collections::HashSet;
 use std::future::Future;
@@ -324,9 +324,18 @@ async fn handle_tproxy_conn(
 
     let inner = tunnel.inner();
     let admission = inner.tcp_admission();
-    let Some((proxy, rule_name, rule_payload)) = inner.resolve_proxy(&metadata) else {
+    let Some(ResolvedTarget {
+        adapter: proxy,
+        rule_name,
+        rule_payload,
+        route,
+    }) = inner.resolve_proxy(&metadata)
+    else {
         return Err("no matching rule".into());
     };
+    // The registry pin is needed only until the dial resolves its chained
+    // front hops — a long-lived relay must not pin the generation.
+    let mut route = Some(route);
 
     info!(
         "{} --> {} match {}({}) using {}",
@@ -352,7 +361,9 @@ async fn handle_tproxy_conn(
 
     _guard
         .run_until_closed(async {
-            match with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await {
+            let dial = with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await;
+            drop(route.take());
+            match dial {
                 Ok(mut remote) => {
                     let up = Arc::clone(_guard.counters());
                     let dn = Arc::clone(_guard.counters());

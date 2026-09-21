@@ -1,6 +1,6 @@
 use crate::relay::{copy_bidirectional_buf_tracked, RELAY_BUF_SIZE};
 use crate::statistics::Statistics;
-use crate::tunnel::TunnelInner;
+use crate::tunnel::{ResolvedTarget, TunnelInner};
 use meow_common::{with_dial_timeout, Metadata, ProxyConn};
 use smallvec::{smallvec, SmallVec};
 use smol_str::SmolStr;
@@ -182,8 +182,7 @@ pub async fn route_inbound_tcp<C>(
 
     // Match rules with lazy enrichment: DNS pre-resolution and process
     // lookup run only if the scan reaches a rule that demands them.
-    let Some((proxy, rule_name, rule_payload)) = inner.resolve_proxy_lazy(&mut metadata).await
-    else {
+    let Some(target) = inner.resolve_proxy_lazy(&mut metadata).await else {
         warn!(
             "{} no matching rule for {}",
             metadata.conn_type,
@@ -196,10 +195,22 @@ pub async fn route_inbound_tcp<C>(
         "{} --> {} match {}({}) using {}",
         metadata.source_address(),
         metadata.remote_address(),
+        target.rule_name,
+        target.rule_payload,
+        target.adapter.name()
+    );
+
+    // `route` pins this generation's dialer registry across the dial —
+    // a mid-dial reload must not strand a chained `dialer-proxy` front hop
+    // on a dead cell (issue #533 review). Held only until the dial
+    // completes: a long-lived relay must not pin the whole generation.
+    let ResolvedTarget {
+        adapter: proxy,
         rule_name,
         rule_payload,
-        proxy.name()
-    );
+        route,
+    } = target;
+    let mut route = Some(route);
 
     // Track the connection — guard drops it on every exit path, including
     // the abort case where the manual close call below would never run.
@@ -224,7 +235,11 @@ pub async fn route_inbound_tcp<C>(
     // this task, its inbound socket and its stats entry forever.
     guard
         .run_until_closed(async {
-            match with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await {
+            let dial = with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await;
+            // All chained front hops resolved during the dial — release the
+            // generation pin before entering the relay loop.
+            drop(route.take());
+            match dial {
                 Ok(mut remote) => {
                     let up = Arc::clone(guard.counters());
                     let dn = Arc::clone(guard.counters());
@@ -335,10 +350,16 @@ mod tests {
             .track(metadata(), "MATCH".into(), "".into(), smallvec![])
             .unwrap();
 
-        assert_eq!(tunnel.reload_routing(Default::default(), vec![], None), 1);
+        assert_eq!(
+            tunnel.reload_routing(Default::default(), vec![], None, Default::default()),
+            1
+        );
         // Same configuration and mode across multiple reloads: a boolean
         // running flag (or config equality) must not admit the old decision.
-        assert_eq!(tunnel.reload_routing(Default::default(), vec![], None), 0);
+        assert_eq!(
+            tunnel.reload_routing(Default::default(), vec![], None, Default::default()),
+            0
+        );
         assert!(late
             .track(metadata(), "MATCH".into(), "".into(), smallvec![])
             .is_none());
@@ -369,7 +390,7 @@ mod tests {
                     admission.track(metadata(), "MATCH".into(), "".into(), smallvec![])
                 });
                 start.wait();
-                tunnel.reload_routing(Default::default(), vec![], None);
+                tunnel.reload_routing(Default::default(), vec![], None, Default::default());
                 registration.join().unwrap()
             });
             if let Some(guard) = guard {

@@ -6,7 +6,7 @@ use meow_common::{DnsMode, Proxy};
 use meow_config::raw::{RawConfig, RawProxyGroup, RawSubscription};
 use meow_dns::{HostEntry, Resolver};
 use meow_trie::DomainTrie;
-use meow_tunnel::Tunnel;
+use meow_tunnel::{ResolvedTarget, Tunnel};
 use parking_lot::RwLock;
 use smallvec::smallvec;
 use std::collections::HashMap;
@@ -43,8 +43,9 @@ fn test_state(raw: RawConfig) -> Arc<AppState> {
     let tunnel = Tunnel::new(resolver);
 
     // Build proxies/rules from raw and apply
-    let (proxies, rules) = meow_config::rebuild_from_raw(&raw).unwrap();
-    tunnel.update_proxies(proxies);
+    let meow_config::RebuildResult { proxies, rules, .. } =
+        meow_config::rebuild_from_raw(&raw).unwrap();
+    tunnel.update_proxies(proxies, Default::default());
     tunnel.update_rules(rules);
 
     let dir = tempfile::tempdir().unwrap();
@@ -83,7 +84,7 @@ fn test_state_with_route(raw: RawConfig, named: Vec<(&str, Arc<dyn Proxy>)>) -> 
     for (name, proxy) in named {
         proxies.insert(smol_str::SmolStr::from(name), proxy);
     }
-    tunnel.update_proxies(proxies);
+    tunnel.update_proxies(proxies, Default::default());
 
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.yaml").to_str().unwrap().to_string();
@@ -120,8 +121,9 @@ fn test_state_with_secret(secret: &str) -> Arc<AppState> {
     ));
     let tunnel = Tunnel::new(resolver);
     let raw = test_raw_config();
-    let (proxies, rules) = meow_config::rebuild_from_raw(&raw).unwrap();
-    tunnel.update_proxies(proxies);
+    let meow_config::RebuildResult { proxies, rules, .. } =
+        meow_config::rebuild_from_raw(&raw).unwrap();
+    tunnel.update_proxies(proxies, Default::default());
     tunnel.update_rules(rules);
 
     let dir = tempfile::tempdir().unwrap();
@@ -209,8 +211,9 @@ async fn external_ui_serves_static_directory() {
     ));
     let tunnel = Tunnel::new(resolver);
     let raw = test_raw_config();
-    let (proxies, rules) = meow_config::rebuild_from_raw(&raw).unwrap();
-    tunnel.update_proxies(proxies);
+    let meow_config::RebuildResult { proxies, rules, .. } =
+        meow_config::rebuild_from_raw(&raw).unwrap();
+    tunnel.update_proxies(proxies, Default::default());
     tunnel.update_rules(rules);
     let state = Arc::new(AppState {
         tunnel,
@@ -1845,7 +1848,7 @@ mod delay_support {
             true,
         ));
         let tunnel = Tunnel::new(resolver);
-        tunnel.update_proxies(proxies);
+        tunnel.update_proxies(proxies, Default::default());
 
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.yaml").to_str().unwrap().to_string();
@@ -1901,7 +1904,7 @@ mod delay_support {
             true,
         ));
         let tunnel = Tunnel::new(resolver);
-        tunnel.update_proxies(proxies);
+        tunnel.update_proxies(proxies, Default::default());
 
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.yaml").to_str().unwrap().to_string();
@@ -2842,8 +2845,9 @@ fn test_state_with_hosts_entry() -> Arc<AppState> {
     let tunnel = Tunnel::new(resolver);
     let mut raw = test_raw_config();
     raw.dns = Some(serde_yaml::from_str("enable: true").unwrap());
-    let (proxies, rules) = meow_config::rebuild_from_raw(&raw).unwrap();
-    tunnel.update_proxies(proxies);
+    let meow_config::RebuildResult { proxies, rules, .. } =
+        meow_config::rebuild_from_raw(&raw).unwrap();
+    tunnel.update_proxies(proxies, Default::default());
     tunnel.update_rules(rules);
 
     let dir = tempfile::tempdir().unwrap();
@@ -3203,7 +3207,11 @@ async fn cold_reload_terminates_live_stream_without_drain_delay() {
         dst_port: 12345,
         ..Default::default()
     };
-    let (proxy, _, _) = state.tunnel.inner().resolve_proxy(&metadata).unwrap();
+    let ResolvedTarget {
+        adapter: proxy,
+        route: _route,
+        ..
+    } = state.tunnel.inner().resolve_proxy(&metadata).unwrap();
     assert_eq!(
         proxy.name(),
         "REJECT",
@@ -3243,8 +3251,9 @@ async fn cold_reload_rejects_tcp_setup_waiting_for_dns() {
             false,
             false,
         )));
-        let (proxies, rules) = meow_config::rebuild_from_raw(&raw).unwrap();
-        tunnel.update_proxies(proxies);
+        let meow_config::RebuildResult { proxies, rules, .. } =
+            meow_config::rebuild_from_raw(&raw).unwrap();
+        tunnel.update_proxies(proxies, Default::default());
         tunnel.update_rules(rules);
         Arc::get_mut(&mut state).unwrap().tunnel = tunnel;
 
@@ -3327,7 +3336,11 @@ async fn cold_reload_rejects_tcp_setup_waiting_for_dns() {
             network: Network::Tcp,
             ..Default::default()
         };
-        let (proxy, _, _) = state.tunnel.inner().resolve_proxy(&metadata).unwrap();
+        let ResolvedTarget {
+            adapter: proxy,
+            route: _route,
+            ..
+        } = state.tunnel.inner().resolve_proxy(&metadata).unwrap();
         assert_eq!(proxy.name(), "REJECT");
         let inner = Arc::clone(state.tunnel.inner());
         let fresh_task = tokio::spawn(async move {
@@ -3607,5 +3620,71 @@ async fn put_configs_rule_set_policy_uses_candidate_providers() {
         put(yaml_missing).await.unwrap().status(),
         StatusCode::BAD_REQUEST,
         "rule-set: policy referencing a provider absent from the candidate must be rejected"
+    );
+    // The rejected commit must not have swapped the live registry — the
+    // candidate carried no providers, so a hoisted commit would silently
+    // empty it (issue #533 review).
+    assert!(
+        state.rule_providers.read().contains_key("doms"),
+        "a rejected commit must leave the live provider registry untouched"
+    );
+}
+
+/// Issue #533 review: a `dns:` section whose nameservers carry `#name`
+/// proxy tags must force a resolver rebuild on EVERY commit — a retained
+/// resolver's captured `#name` adapters hold `Weak`s into the OLD registry
+/// cell, which dies at the route swap. Two PUTs with identical `dns:` but
+/// a changed rule must still swap the resolver generation.
+#[tokio::test]
+async fn put_configs_rebuilds_resolver_when_dns_uses_runtime_refs() {
+    use base64::Engine as _;
+    let state = test_state(RawConfig {
+        rules: Some(vec!["MATCH,DIRECT".into()]),
+        ..Default::default()
+    });
+    let put = |yaml: &str| {
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "dns:\n",
+        "  enable: true\n",
+        "  nameserver:\n",
+        "    - tcp://127.0.0.1:9#hop\n",
+        "proxies:\n",
+        "  - {name: hop, type: socks5, server: 127.0.0.1, port: 11080}\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    assert_eq!(
+        put(yaml).await.unwrap().status(),
+        StatusCode::NO_CONTENT,
+        "config with a `#hop` nameserver must commit"
+    );
+    let first = state.tunnel.resolver();
+
+    // Second commit: identical `dns:` section, a different rule. The
+    // runtime `#hop` ref must still force a resolver rebuild — a retained
+    // resolver would keep resolving through the registry cell that just
+    // died with the route swap.
+    let yaml2 = yaml.replace(
+        "rules:\n  - MATCH,DIRECT\n",
+        "rules:\n  - DOMAIN,example.com,DIRECT\n  - MATCH,DIRECT\n",
+    );
+    assert_eq!(put(&yaml2).await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert!(
+        !Arc::ptr_eq(&first, &state.tunnel.resolver()),
+        "a `#name`-tagged dns section must force a resolver rebuild on every commit"
     );
 }
