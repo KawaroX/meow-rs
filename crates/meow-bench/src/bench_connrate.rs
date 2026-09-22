@@ -39,6 +39,10 @@ pub async fn bench_conn_rate(
         handles.push(tokio::spawn(async move {
             while Instant::now() < deadline {
                 let Ok(mut stream) = socks5_connect(proxy, echo).await else {
+                    // Backoff on failure — a dead listener would otherwise
+                    // spin every worker hot for the rest of the window
+                    // (same pattern as bench_reload's spawn_load).
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 };
                 let timed_out = tokio::time::timeout(ECHO_TIMEOUT, async {
@@ -84,33 +88,35 @@ pub async fn bench_conn_rate(
     })
 }
 
-// Not yet wired into main.rs; infrastructure added for M2 close-summary.
-#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SteadyStateResult {
     pub sample_count: usize,
+    /// Median `(rss - idle_rss) / concurrency` — the per-connection heap
+    /// delta the documented ~35 KB baseline and <32 KB M2 target use.
     pub median_bytes_per_conn: f64,
     pub p95_bytes_per_conn: f64,
+    /// Median absolute RSS under load (context for the delta).
     pub median_rss_bytes: u64,
+    /// RSS sampled before the workload started — the delta baseline.
+    pub idle_rss_bytes: u64,
 }
 
 /// Steady-state bytes-per-connection measurement (ADR-0011 §2 M-steady).
 ///
 /// Runs a `bench_conn_rate`-style workload for `duration_secs`, then samples
-/// `(rss_bytes, live_conn_count)` at 1 Hz over the **middle** `sample_secs`
-/// window.  Returns the median and p95 of `rss_bytes / live_conn_count`.
+/// the proxy's RSS at 4 Hz over the **middle** `sample_secs` window.
+/// Returns the median and p95 of `(rss - idle_rss) / live_conn_count` — the
+/// *delta* over the idle baseline captured before workers spawn, matching
+/// the ~35 KB/conn figure in `docs/benchmarks/footprint-rss-baseline.md`
+/// and the <32 KB M2 target (absolute RSS/conn can never reach it: even a
+/// zero-overhead conn carries the ~9 MB idle floor).
 ///
-/// `live_conn_count` is approximated from the `Statistics` REST endpoint, or
-/// from the active-connection counter exposed by the proxy via its process
-/// metrics.  For this baseline implementation we approximate it as
-/// `concurrency` (the number of inflight concurrent requests) — the true live
-/// count converges to `concurrency` at steady state since each worker keeps
-/// one connection open at a time.
+/// `live_conn_count` is approximated as `concurrency` (the number of
+/// inflight concurrent requests) — the true live count converges to it at
+/// steady state since each worker keeps one connection open at a time.
 ///
 /// This is the headline M2 close-summary number per architect directive
 /// 2026-05-12.
-// Not yet wired into main.rs; infrastructure added for M2 close-summary.
-#[allow(dead_code)]
 pub async fn bench_connrate_steady_state(
     proxy: SocketAddr,
     echo: SocketAddr,
@@ -118,6 +124,30 @@ pub async fn bench_connrate_steady_state(
     concurrency: usize,
     proxy_pid: u32,
 ) -> anyhow::Result<SteadyStateResult> {
+    anyhow::ensure!(
+        duration_secs >= 3,
+        "steady-state needs --duration >= 3 (middle-third sample window)"
+    );
+    // Warm the datapath before the baseline: first-conn lazy init
+    // (resolver/rule caches, adapter warm paths) would otherwise land in
+    // the per-conn delta.
+    for _ in 0..8 {
+        if let Ok(mut s) = socks5_connect(proxy, echo).await {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let _ = tokio::time::timeout(ECHO_TIMEOUT, async {
+                s.write_all(&[0x42]).await?;
+                let mut b = [0u8; 1];
+                s.read_exact(&mut b).await?;
+                Ok::<_, std::io::Error>(())
+            })
+            .await;
+        }
+    }
+    // Idle baseline: the proxy is already up but no load has run — the
+    // delta against the loaded samples is the per-conn footprint.  A
+    // failed `ps` must fail the leg: `unwrap_or(0)` would silently turn
+    // the delta metric into absolute RSS/conn.
+    let idle_rss = measure_rss(proxy_pid)?;
     let counter = Arc::new(AtomicU64::new(0));
     let deadline = Instant::now() + Duration::from_secs(duration_secs);
 
@@ -128,6 +158,7 @@ pub async fn bench_connrate_steady_state(
         handles.push(tokio::spawn(async move {
             while Instant::now() < deadline {
                 let Ok(mut stream) = socks5_connect(proxy, echo).await else {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 };
                 let _ = tokio::time::timeout(ECHO_TIMEOUT, async {
@@ -153,23 +184,35 @@ pub async fn bench_connrate_steady_state(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // Sample at 1 Hz over the middle third.
+    // Sample at 4 Hz over the middle third — at the default
+    // `--duration 10` the window is only ~3 s, and single-digit n makes
+    // p95 pure noise.
     let mut samples: Vec<f64> = Vec::new();
     let mut rss_samples: Vec<u64> = Vec::new();
     while start.elapsed().as_secs() < sample_end {
         if let Ok(rss) = measure_rss(proxy_pid) {
             // At steady state, concurrency == number of inflight connections.
-            let bytes_per_conn = rss as f64 / concurrency as f64;
+            // The metric is the DELTA over the idle baseline — absolute
+            // RSS/conn counts the ~9 MB idle floor toward every conn.
+            let bytes_per_conn = rss.saturating_sub(idle_rss) as f64 / concurrency as f64;
             samples.push(bytes_per_conn);
             rss_samples.push(rss);
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
     // Wait for workers.
     for h in handles {
         let _ = h.await;
     }
+
+    // Zero samples means every `ps` call failed — serializing a zeroed
+    // result would poison the trend with a plausible-looking garbage
+    // point; fail the leg instead.
+    anyhow::ensure!(
+        !samples.is_empty(),
+        "steady-state: no RSS samples collected (every measure_rss call failed)"
+    );
 
     // Compute median + p95.
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -178,7 +221,7 @@ pub async fn bench_connrate_steady_state(
     let n = samples.len();
     let median_bytes_per_conn = if n > 0 { samples[n / 2] } else { 0.0 };
     let p95_bytes_per_conn = if n > 0 {
-        samples[(n as f64 * 0.95) as usize]
+        samples[((n as f64 * 0.95) as usize).min(n - 1)]
     } else {
         0.0
     };
@@ -189,10 +232,11 @@ pub async fn bench_connrate_steady_state(
     };
 
     eprintln!(
-        "  steady-state: {n} samples  median {:.0} bytes/conn  p95 {:.0} bytes/conn  median RSS {:.1} MB",
+        "  steady-state: {n} samples  median {:.0} bytes/conn  p95 {:.0} bytes/conn  median RSS {:.1} MB (idle {:.1} MB)",
         median_bytes_per_conn,
         p95_bytes_per_conn,
         median_rss_bytes as f64 / 1_048_576.0,
+        idle_rss as f64 / 1_048_576.0,
     );
 
     Ok(SteadyStateResult {
@@ -200,5 +244,6 @@ pub async fn bench_connrate_steady_state(
         median_bytes_per_conn,
         p95_bytes_per_conn,
         median_rss_bytes,
+        idle_rss_bytes: idle_rss,
     })
 }

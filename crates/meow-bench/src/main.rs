@@ -5,6 +5,7 @@ mod bench_idle_conns;
 mod bench_latency;
 mod bench_memleak;
 mod bench_memory;
+mod bench_reload;
 mod bench_throughput;
 mod echo_server;
 mod results;
@@ -66,9 +67,44 @@ struct Args {
     #[arg(long, default_value = "64")]
     concurrency: usize,
 
-    /// Run only a specific benchmark (throughput, latency, connrate, dns, memleak)
+    /// Run only a specific benchmark (throughput, latency, connrate, dns,
+    /// memleak, reload, idle, steady, proxied)
     #[arg(long)]
     only: Option<String>,
+
+    /// Config that routes through a real outbound adapter (e.g. VLESS →
+    /// sing-box); requires --singbox-binary. Adds the `proxied` workload:
+    /// W1–W3 run against this config instead of the direct one.
+    #[arg(long)]
+    proxy_config: Option<PathBuf>,
+
+    /// sing-box binary used as the proxied workload's server half
+    /// (VLESS inbound → direct outbound, generated in-process)
+    #[arg(long)]
+    singbox_binary: Option<PathBuf>,
+
+    /// Config for the `reload` workload — must enable `external-controller`
+    /// on --api-port, bind `mixed-port` 17890, and carry the
+    /// `DST-PORT,17895,bench-direct` probe rule (see
+    /// config-bench-reload.yaml)
+    #[arg(long, default_value = "config-bench-reload.yaml")]
+    reload_config: PathBuf,
+
+    /// REST API port the reload config's external-controller binds
+    #[arg(long, default_value = "17892")]
+    api_port: u16,
+
+    /// PUT /configs count spread across the reload workload's load window
+    #[arg(long, default_value = "10")]
+    reloads: usize,
+
+    /// Idle-connection count for the `idle` workload (ADR-0011 M-idle)
+    #[arg(long, default_value = "10000")]
+    idle_conns: usize,
+
+    /// Hold window for the `idle` workload in seconds
+    #[arg(long, default_value = "30")]
+    idle_hold_secs: u64,
 
     /// Config for the memleak test (separate from the perf-bench config,
     /// because it needs a live proxy with internet access, e.g. ECH-TLS-tunnel)
@@ -89,6 +125,45 @@ struct Args {
 }
 
 const PROXY_PORT: u16 = 17890;
+
+/// Proxied workload (#558): the sing-box VLESS server half listens on this
+/// port; `config-bench-vless.yaml` dials it.  Loopback-only, spawned for
+/// the duration of the proxied runs.
+const VLESS_SERVER_PORT: u16 = 17893;
+/// Must match `uuid:` in config-bench-vless.yaml.
+const VLESS_SERVER_UUID: &str = "9b2e0d8a-0000-4000-8000-00000000b1e5";
+
+/// Spawn `sing-box run` with a generated VLESS inbound (direct outbound).
+/// Returns the child + the tempdir holding the config — keep both alive
+/// for the duration of the proxied benchmarks.
+fn start_singbox_server(bin: &Path) -> anyhow::Result<(std::process::Child, tempfile::TempDir)> {
+    let dir = tempfile::tempdir()?;
+    let config = format!(
+        r#"{{
+  "log": {{"level": "warn"}},
+  "inbounds": [{{
+    "type": "vless",
+    "tag": "vless-in",
+    "listen": "127.0.0.1",
+    "listen_port": {VLESS_SERVER_PORT},
+    "users": [{{"name": "bench", "uuid": "{VLESS_SERVER_UUID}"}}]
+  }}],
+  "outbounds": [{{"type": "direct", "tag": "out"}}]
+}}"#
+    );
+    let config_path = dir.path().join("singbox.json");
+    std::fs::write(&config_path, config)?;
+    let child = Command::new(bin)
+        .arg("run")
+        .arg("-c")
+        .arg(&config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to start sing-box at {}: {e}", bin.display()))?;
+    Ok((child, dir))
+}
 
 /// Best-effort provenance for the JSON artifact — every field degrades
 /// to `None` rather than failing the run.
@@ -117,10 +192,30 @@ fn collect_meta(args: &Args) -> results::BenchMeta {
     }
 }
 
-async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> anyhow::Result<()> {
+/// One connect attempt inside `wait_for_port*` — bounded so a filtered
+/// or black-holed address cannot overshoot the outer deadline.
+async fn probe_tcp(addr: SocketAddr) -> bool {
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .is_ok_and(|r| r.is_ok())
+}
+
+/// Port-readiness wait that also fails fast when the child already
+/// exited — otherwise a config-rejected spawn reports "timeout waiting"
+/// after the full deadline instead of "exited early" on the first poll.
+async fn wait_for_port_guarded(
+    addr: SocketAddr,
+    timeout: Duration,
+    child: &mut ChildGuard,
+    what: &str,
+) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+        child.ensure_alive(what)?;
+        if probe_tcp(addr).await {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -130,10 +225,111 @@ async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> anyhow::Result<()
     }
 }
 
-async fn wait_for_udp_port(addr: SocketAddr, timeout: Duration) -> anyhow::Result<()> {
+/// Raise this process's `RLIMIT_NOFILE` soft limit toward the hard
+/// limit.  The macOS default of 256 starves conn-heavy workloads long
+/// before any real limit — BOTH sides pay per conn: the harness holds
+/// the client socket and the spawned proxy holds inbound + outbound
+/// (rlimits are inherited across exec, so children get it free).
+#[cfg(unix)]
+fn raise_nofile_limit() {
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
+            let target = lim.rlim_max.min(65_536);
+            if lim.rlim_cur < target {
+                lim.rlim_cur = target;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                    eprintln!(
+                        "[warn] setrlimit(RLIMIT_NOFILE, {target}) failed ({}) — conn-heavy legs may hit the low cap",
+                        std::io::Error::last_os_error()
+                    );
+                } else {
+                    // XNU can *silently clamp* rlim_cur to
+                    // kern.maxfilesperproc and still return 0 — re-read
+                    // to confirm the raise actually landed.
+                    let mut after = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut after) == 0
+                        && after.rlim_cur < target
+                    {
+                        eprintln!(
+                            "[warn] RLIMIT_NOFILE clamped to {} (wanted {target}) — conn-heavy legs may hit the low cap",
+                            after.rlim_cur
+                        );
+                    }
+                }
+            }
+        } else {
+            eprintln!(
+                "[warn] getrlimit(RLIMIT_NOFILE) failed ({}) — conn-heavy legs may hit the low cap",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// Fail fast when a stale process squats the port a spawned child is
+/// about to bind — `wait_for_port` alone cannot tell our listener from
+/// a squatter's, and meow treats listener bind failure as non-fatal
+/// (the child stays alive serving nothing).
+fn ensure_port_free(addr: SocketAddr, what: &str) -> anyhow::Result<()> {
+    match std::net::TcpListener::bind(addr) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(e) => {
+            anyhow::bail!("{what}: {addr} already bound ({e}) — stale process squats the port")
+        }
+    }
+}
+
+/// UDP variant of `ensure_port_free` — the DNS leg's probe would
+/// otherwise happily measure a stale DNS responder still holding the
+/// port (any datagram answer looks "ready").
+fn ensure_udp_port_free(addr: SocketAddr, what: &str) -> anyhow::Result<()> {
+    match std::net::UdpSocket::bind(addr) {
+        Ok(sock) => {
+            drop(sock);
+            Ok(())
+        }
+        Err(e) => {
+            anyhow::bail!("{what}: {addr}/udp already bound ({e}) — stale process squats the port")
+        }
+    }
+}
+
+/// Spawn the proxy under test with bench-standard stdio (quiet stdout,
+/// inherited stderr so config rejection is never silent).
+fn spawn_meow(
+    binary: &Path,
+    binary_arg: &str,
+    config: &Path,
+) -> anyhow::Result<std::process::Child> {
+    Command::new(binary)
+        .arg(binary_arg)
+        .arg(config.as_os_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to start {}: {e}", binary.display()))
+}
+
+async fn wait_for_udp_port_guarded(
+    addr: SocketAddr,
+    timeout: Duration,
+    child: &mut ChildGuard,
+    what: &str,
+) -> anyhow::Result<()> {
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RecordType};
-    use hickory_proto::serialize::binary::BinEncodable;
+    use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
     use tokio::net::UdpSocket;
 
     let deadline = tokio::time::Instant::now() + timeout;
@@ -148,12 +344,20 @@ async fn wait_for_udp_port(addr: SocketAddr, timeout: Duration) -> anyhow::Resul
     let probe = msg.to_bytes()?;
 
     loop {
+        // Fail fast on a config-rejected child instead of spinning the
+        // full deadline — same contract as `wait_for_port_guarded`.
+        child.ensure_alive(what)?;
         let _ = sock.send_to(&probe, addr).await;
         let mut buf = [0u8; 512];
-        let ready =
-            tokio::time::timeout(Duration::from_millis(200), sock.recv_from(&mut buf)).await;
-        if ready.is_ok() {
-            return Ok(());
+        // Ready only when the answer parses as a DNS *response* — any
+        // datagram (or a recv io error) is not a readiness signal.
+        if let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(200), sock.recv_from(&mut buf)).await
+        {
+            if Message::from_bytes(&buf[..n]).is_ok_and(|m| m.message_type == MessageType::Response)
+            {
+                return Ok(());
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!("timeout waiting for DNS port {addr} to become reachable");
@@ -221,6 +425,26 @@ impl ChildGuard {
         self.0.as_ref().map_or(0, std::process::Child::id)
     }
 
+    /// Bail if the child already exited — e.g. it rejected the config.
+    /// Note this does NOT detect the squatter case: meow treats listener
+    /// bind failure as non-fatal and stays alive, so a port squatter is
+    /// caught by `ensure_port_free` before spawn (with an inherent small
+    /// TOCTOU window), not by this check.
+    fn ensure_alive(&mut self, target_name: &str) -> anyhow::Result<()> {
+        if let Some(child) = self.0.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    anyhow::bail!(
+                        "{target_name} exited early with {status} — is the port squatted?"
+                    );
+                }
+                Err(e) => anyhow::bail!("{target_name}: cannot query child status: {e}"),
+                Ok(None) => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Success-path shutdown: gracefully stop the child, then disarm
     /// the guard so `Drop` is a no-op.
     async fn shutdown(mut self) {
@@ -254,6 +478,8 @@ async fn benchmark_target(
     config: &Path,
     target_name: &str,
     args: &Args,
+    only: Option<&str>,
+    dns_config: Option<&Path>,
 ) -> anyhow::Result<BenchmarkResults> {
     let proxy_addr: SocketAddr = format!("127.0.0.1:{PROXY_PORT}").parse()?;
 
@@ -262,25 +488,19 @@ async fn benchmark_target(
     eprintln!("[{target_name}] echo server on {echo_addr}");
 
     eprintln!("[{}] starting proxy: {}", target_name, binary.display());
+    ensure_port_free(proxy_addr, target_name)?;
 
     // Start proxy process (SOCKS5 config for W1–W3).  The guard reaps
     // the child on every error path; the success path reaps it
     // explicitly via `ChildGuard::shutdown`.
-    let child = ChildGuard::new(
-        Command::new(binary)
-            .arg(&args.binary_arg)
-            .arg(config.as_os_str())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("failed to start {}: {}", binary.display(), e))?,
-    );
+    let mut child = ChildGuard::new(spawn_meow(binary, &args.binary_arg, config)?);
 
     let pid = child.id();
 
     // Wait for SOCKS5 port to be ready (the guard reaps the child if
-    // this or any later step fails).
-    wait_for_port(proxy_addr, Duration::from_secs(10)).await?;
+    // this or any later step fails).  The guarded wait also fails fast
+    // on a config-rejected early exit instead of burning the deadline.
+    wait_for_port_guarded(proxy_addr, Duration::from_secs(10), &mut child, target_name).await?;
     eprintln!("[{target_name}] proxy ready on port {PROXY_PORT}");
 
     // Settle time
@@ -327,8 +547,8 @@ async fn benchmark_target(
         eprintln!("[{target_name}] warmup deadline hit — continuing anyway");
     }
 
-    let run_all = args.only.is_none();
-    let only = args.only.as_deref().unwrap_or("");
+    let run_all = only.is_none();
+    let only = only.unwrap_or("");
 
     // W1 — Throughput
     eprintln!("[{target_name}] benchmarking throughput...");
@@ -356,7 +576,9 @@ async fn benchmark_target(
         let cr =
             bench_connrate::bench_conn_rate(proxy_addr, echo_addr, args.duration, args.concurrency)
                 .await?;
-        let peak_rss = rss_handle.await?.unwrap_or(0);
+        // Propagate rather than `unwrap_or(0)` — a zero here serializes
+        // as a fake -100 % RSS "improvement" in compare.py.
+        let peak_rss = rss_handle.await??;
         (Some(cr), peak_rss)
     } else {
         // Skipped: `rss_load` stays the idle reading — rendering shows
@@ -379,45 +601,53 @@ async fn benchmark_target(
     echo_handle.abort();
 
     // W4 — DNS QPS (separate process with DNS-enabled config)
-    let dns = match (run_all || only == "dns", args.dns_config.as_ref()) {
+    let dns = match (run_all || only == "dns", dns_config) {
         (true, Some(dns_config)) => {
             eprintln!("[{}] starting DNS proxy: {}", target_name, binary.display());
 
-            let dns_child = ChildGuard::new(
-                Command::new(binary)
-                    .arg(&args.binary_arg)
-                    .arg(dns_config.as_os_str())
-                    .stdout(Stdio::null())
-                    // Inherit stderr like the primary child: if the DNS
-                    // config is rejected (e.g. mihomo chokes on a field)
-                    // the failure must be visible, not a silent
-                    // `dns: null` in the results.
-                    .stderr(Stdio::inherit())
-                    .spawn()
-                    .map_err(|e| anyhow::anyhow!("failed to start DNS proxy: {e}"))?,
-            );
-
+            // spawn_meow inherits stderr like the primary child: if the
+            // DNS config is rejected (e.g. mihomo chokes on a field) the
+            // failure must be visible, not a silent `dns: null` in the
+            // results.
             let dns_addr: SocketAddr = format!("127.0.0.1:{}", args.dns_port).parse()?;
 
-            let ready = wait_for_udp_port(dns_addr, Duration::from_secs(10)).await;
-            if let Err(e) = ready {
-                eprintln!("[{target_name}] DNS port not ready: {e} — skipping W4");
+            // A stale responder still bound on the DNS port answers the
+            // probe and W4 would measure IT, not the spawned child —
+            // the UDP squatter check has to run before spawn (meow
+            // survives a failed bind, so ensure_alive cannot catch it).
+            if let Err(e) = ensure_udp_port_free(dns_addr, "DNS proxy") {
+                eprintln!("[{target_name}] {e} — skipping W4");
                 None
             } else {
-                eprintln!("[{target_name}] DNS proxy ready on {dns_addr}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                let mut dns_child =
+                    ChildGuard::new(spawn_meow(binary, &args.binary_arg, dns_config)?);
 
-                eprintln!("[{target_name}] benchmarking DNS QPS...");
-                let dns_result = bench_dns::bench_dns(dns_addr, args.duration).await;
+                let ready = wait_for_udp_port_guarded(
+                    dns_addr,
+                    Duration::from_secs(10),
+                    &mut dns_child,
+                    "DNS proxy",
+                )
+                .await;
+                if let Err(e) = ready {
+                    eprintln!("[{target_name}] DNS port not ready: {e} — skipping W4");
+                    None
+                } else {
+                    eprintln!("[{target_name}] DNS proxy ready on {dns_addr}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
 
-                // Graceful stop (SIGTERM + grace on Unix), no Child leak.
-                dns_child.shutdown().await;
+                    eprintln!("[{target_name}] benchmarking DNS QPS...");
+                    let dns_result = bench_dns::bench_dns(dns_addr, args.duration).await;
 
-                match dns_result {
-                    Ok(r) => Some(r),
-                    Err(e) => {
-                        eprintln!("[{target_name}] DNS bench error: {e}");
-                        None
+                    // Graceful stop (SIGTERM + grace on Unix), no Child leak.
+                    dns_child.shutdown().await;
+
+                    match dns_result {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            eprintln!("[{target_name}] DNS bench error: {e}");
+                            None
+                        }
                     }
                 }
             }
@@ -440,35 +670,156 @@ async fn benchmark_target(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let only = args.only.as_deref();
+
+    // Reject unknown/partially-specified legs up front — a typo'd `--only`
+    // otherwise yields an empty all-null report that exits 0.
+    const VALID_ONLY: &[&str] = &[
+        "throughput",
+        "latency",
+        "connrate",
+        "dns",
+        "memleak",
+        "reload",
+        "idle",
+        "steady",
+        "proxied",
+    ];
+    if let Some(o) = only {
+        anyhow::ensure!(
+            VALID_ONLY.contains(&o),
+            "unknown --only '{o}' (expected one of: {})",
+            VALID_ONLY.join(", ")
+        );
+        anyhow::ensure!(
+            o != "proxied" || args.proxy_config.is_some(),
+            "--only proxied requires --proxy-config (and --singbox-binary)"
+        );
+    }
+
+    #[cfg(unix)]
+    raise_nofile_limit();
 
     eprintln!("=== meow-rs benchmark suite ===\n");
 
-    // Memleak test is a standalone flow — it dials real external hosts through
-    // the proxy instead of using a local echo server.
-    if args.only.as_deref() == Some("memleak") {
-        return run_memleak_test(&args).await;
+    // Proxied-outbound leg (#558): a sing-box VLESS server fronts the echo
+    // target so W1–W3 exercise a real outbound adapter. `--only proxied`
+    // skips the direct legs entirely; a single-workload `--only` (e.g.
+    // throughput) runs it on both direct and proxied legs.
+    let want_proxied = args.proxy_config.is_some()
+        && matches!(
+            only,
+            None | Some("proxied") | Some("throughput") | Some("latency") | Some("connrate")
+        );
+    if args.proxy_config.is_some() && !want_proxied {
+        eprintln!("[warn] --proxy-config ignored: --only {only:?} runs no proxied leg");
+    }
+    if args.singbox_binary.is_some() && !want_proxied {
+        eprintln!("[warn] --singbox-binary ignored: no proxied leg in this run");
     }
 
-    // Benchmark Rust
-    let rust_results = benchmark_target(&args.rust_binary, &args.config, "rust", &args).await?;
+    // Standalone flows — each spawns its own proxy and exits:
+    // `memleak` dials real external hosts; `reload` drives PUT /configs;
+    // `idle`/`steady` are the ADR-0011 M-idle/M-steady footprint metrics.
+    match only {
+        Some("memleak") => return run_memleak_test(&args).await,
+        Some("reload") => return run_reload_test(&args).await,
+        Some("idle") | Some("steady") => return run_footprint_test(&args).await,
+        _ => {}
+    }
+
+    let mut singbox = if want_proxied {
+        let Some(bin) = &args.singbox_binary else {
+            anyhow::bail!("--proxy-config requires --singbox-binary (the VLESS server half)");
+        };
+        eprintln!("[proxied] starting sing-box server: {}", bin.display());
+        let vless_addr: SocketAddr = format!("127.0.0.1:{VLESS_SERVER_PORT}").parse()?;
+        ensure_port_free(vless_addr, "sing-box")?;
+        let (child, dir) = start_singbox_server(bin)?;
+        let mut guard = ChildGuard::new(child);
+        wait_for_port_guarded(vless_addr, Duration::from_secs(10), &mut guard, "sing-box").await?;
+        eprintln!("[proxied] sing-box ready on {vless_addr}");
+        Some((guard, dir))
+    } else {
+        None
+    };
+
+    // On the proxied legs `--only proxied` means the whole W1–W3 suite;
+    // DNS is skipped (it never traverses the outbound adapter).
+    let proxied_only = if only == Some("proxied") { None } else { only };
+    let dns = args.dns_config.as_deref();
+
+    // Benchmark Rust (direct) — skipped entirely on a `--only proxied` run.
+    let rust_results = if only == Some("proxied") {
+        None
+    } else {
+        Some(benchmark_target(&args.rust_binary, &args.config, "rust", &args, only, dns).await?)
+    };
+
+    // No TIME_WAIT cooldown between the direct and proxied legs: the
+    // residual sockets are client-side on loopback ephemeral ports and
+    // the same asymmetry applies to the go legs below, so the rust-vs-go
+    // proxied comparison stays symmetric.
+    let rust_proxied = if want_proxied {
+        Some(
+            benchmark_target(
+                &args.rust_binary,
+                args.proxy_config.as_deref().expect("gated above"),
+                "rust-proxied",
+                &args,
+                proxied_only,
+                None,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
     eprintln!();
 
     // Benchmark Go (if binary provided)
-    let go_results = if let Some(go_binary) = &args.go_binary {
+    let (go_results, go_proxied) = if let Some(go_binary) = &args.go_binary {
         // Wait for TIME_WAIT sockets to clear (macOS default is 15-30s)
         eprintln!("[*] waiting 60s for ephemeral ports to recycle...");
         tokio::time::sleep(Duration::from_secs(60)).await;
-        Some(benchmark_target(go_binary, &args.config, "go", &args).await?)
+        let direct = if only == Some("proxied") {
+            None
+        } else {
+            Some(benchmark_target(go_binary, &args.config, "go", &args, only, dns).await?)
+        };
+        let proxied = if want_proxied {
+            Some(
+                benchmark_target(
+                    go_binary,
+                    args.proxy_config.as_deref().expect("gated above"),
+                    "go-proxied",
+                    &args,
+                    proxied_only,
+                    None,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        (direct, proxied)
     } else {
         eprintln!("[go] skipped (no --go-binary provided)\n");
-        None
+        (None, None)
     };
+
+    if let Some((guard, _dir)) = singbox.take() {
+        eprintln!("[proxied] stopping sing-box...");
+        guard.shutdown().await;
+    }
 
     let report = ComparisonReport {
         meta: collect_meta(&args),
         rust: rust_results,
+        rust_proxied,
         go: go_results,
+        go_proxied,
     };
 
     // Output JSON
@@ -507,21 +858,25 @@ async fn run_memleak_test(args: &Args) -> anyhow::Result<()> {
     }
 
     eprintln!("[memleak] starting proxy...");
+    ensure_port_free(proxy_addr, "memleak proxy")?;
     // The guard reaps the child on every error path below (`?`
     // returns included); the success path stops it gracefully via
     // `ChildGuard::shutdown`.
-    let child = ChildGuard::new(
-        Command::new(&args.rust_binary)
-            .args(["-f", &args.memleak_config.to_string_lossy()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("failed to start {}: {e}", args.rust_binary.display()))?,
-    );
+    let mut child = ChildGuard::new(spawn_meow(
+        &args.rust_binary,
+        &args.binary_arg,
+        &args.memleak_config,
+    )?);
 
     let pid = child.id();
 
-    wait_for_port(proxy_addr, Duration::from_secs(15)).await?;
+    wait_for_port_guarded(
+        proxy_addr,
+        Duration::from_secs(15),
+        &mut child,
+        "memleak proxy",
+    )
+    .await?;
     eprintln!(
         "[memleak] proxy ready (pid {pid}) on port {}",
         args.memleak_port
@@ -559,6 +914,208 @@ async fn run_memleak_test(args: &Args) -> anyhow::Result<()> {
     }
 
     if result.slope_kb_per_round > 50.0 && result.r_squared > 0.7 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Standalone ADR-0011 footprint workloads (`--only idle` / `--only
+/// steady`, #558): spawn the proxy on the perf config and run the metric
+/// collector.  M-idle holds N open connections and reports RSS per conn;
+/// M-steady samples bytes-per-conn over the middle third of a sustained
+/// conn-rate window.
+async fn run_footprint_test(args: &Args) -> anyhow::Result<()> {
+    let proxy_addr: SocketAddr = format!("127.0.0.1:{PROXY_PORT}").parse()?;
+    let (echo_addr, echo_handle) = echo_server::start_echo_server().await?;
+
+    ensure_port_free(proxy_addr, "proxy")?;
+    let mut child = ChildGuard::new(spawn_meow(
+        &args.rust_binary,
+        &args.binary_arg,
+        &args.config,
+    )?);
+    let pid = child.id();
+    wait_for_port_guarded(proxy_addr, Duration::from_secs(10), &mut child, "proxy").await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let result = match args.only.as_deref() {
+        Some("idle") => serde_json::to_string_pretty(
+            &bench_idle_conns::bench_idle_conns(
+                proxy_addr,
+                echo_addr,
+                args.idle_conns,
+                args.idle_hold_secs,
+                pid,
+            )
+            .await?,
+        )?,
+        _ => serde_json::to_string_pretty(
+            &bench_connrate::bench_connrate_steady_state(
+                proxy_addr,
+                echo_addr,
+                args.duration,
+                args.concurrency,
+                pid,
+            )
+            .await?,
+        )?,
+    };
+
+    child.shutdown().await;
+    echo_handle.abort();
+
+    if let Some(output_path) = &args.output {
+        std::fs::write(output_path, &result)?;
+        eprintln!("results written to {}", output_path.display());
+    } else {
+        println!("{result}");
+    }
+    Ok(())
+}
+
+/// Fixed port for the reload workload's datapath probe echo listener.
+/// The two reload configs name it in a `DST-PORT` rule that flips
+/// between a working outbound and REJECT, which is how the workload
+/// verifies a committed config actually reached the datapath.
+const RELOAD_PROBE_PORT: u16 = 17895;
+
+/// The probe-rule list item `config-bench-reload.yaml` carries; the B
+/// variant is generated by swapping its target to REJECT.  Matched as a
+/// full trimmed line — a comment quoting the rule or a longer rule like
+/// `DST-PORT,17895,bench-direct-foo` must not count as the probe rule.
+const RELOAD_PROBE_RULE: &str = "- DST-PORT,17895,bench-direct";
+
+/// Standalone config-reload workload (`--only reload`, #558): steady echo
+/// load while `PUT /configs` runs `args.reloads` times, alternating
+/// between `--reload-config` and a generated REJECT-probe variant, then
+/// probes datapath parity AND verifies the last committed config is
+/// observable.  Requires `--reload-config` with `external-controller`
+/// bound to `--api-port`, `mixed-port` 17890, and the
+/// `DST-PORT,17895,bench-direct` probe rule.
+async fn run_reload_test(args: &Args) -> anyhow::Result<()> {
+    let proxy_addr: SocketAddr = format!("127.0.0.1:{PROXY_PORT}").parse()?;
+    let api_addr: SocketAddr = format!("127.0.0.1:{}", args.api_port).parse()?;
+    let probe_addr: SocketAddr = format!("127.0.0.1:{RELOAD_PROBE_PORT}").parse()?;
+
+    if !args.reload_config.exists() {
+        anyhow::bail!(
+            "reload config not found: {}  (needs external-controller on port {})",
+            args.reload_config.display(),
+            args.api_port
+        );
+    }
+
+    // Build the B variant: identical except the probe rule targets
+    // REJECT, so a committed generation is observable through the
+    // datapath.  Fails loudly if the config drifted from the expected
+    // probe-rule line — a silently-absent rule would make every commit
+    // look verified.
+    let config_text = std::fs::read_to_string(&args.reload_config)?;
+    anyhow::ensure!(
+        config_text
+            .lines()
+            .filter(|l| l.trim() == RELOAD_PROBE_RULE)
+            .count()
+            == 1,
+        "reload config {} must contain exactly one '{RELOAD_PROBE_RULE}' list item \
+         (see config-bench-reload.yaml)",
+        args.reload_config.display()
+    );
+    // Cheap contract check while the text is in hand: a config whose
+    // external-controller doesn't bind --api-port otherwise surfaces
+    // only as a 10 s port-wait timeout.
+    anyhow::ensure!(
+        config_text.contains("external-controller")
+            && config_text.contains(&format!(":{}", args.api_port)),
+        "reload config {} must set 'external-controller' bound to --api-port {}",
+        args.reload_config.display(),
+        args.api_port
+    );
+    // Swap the target on the one matching list-item line (line-anchored,
+    // so a comment quoting the rule is never rewritten).
+    let mut alt_text = String::with_capacity(config_text.len());
+    let mut swapped = false;
+    for line in config_text.lines() {
+        if !swapped && line.trim() == RELOAD_PROBE_RULE {
+            alt_text.push_str(&line.replacen("bench-direct", "REJECT", 1));
+            swapped = true;
+        } else {
+            alt_text.push_str(line);
+        }
+        alt_text.push('\n');
+    }
+    debug_assert!(swapped, "probe rule line guaranteed by the check above");
+    let alt_dir = tempfile::tempdir()?;
+    let alt_path = alt_dir.path().join("config-bench-reload-b.yaml");
+    std::fs::write(&alt_path, alt_text)?;
+
+    // Free-port checks before binding anything — a squatter on the
+    // probe port otherwise surfaces as a bare "Address already in use"
+    // with no context.
+    ensure_port_free(proxy_addr, "reload proxy")?;
+    ensure_port_free(api_addr, "reload API")?;
+    ensure_port_free(probe_addr, "reload probe echo")?;
+    let (echo_addr, echo_handle) = echo_server::start_echo_server().await?;
+    let (_probe_echo_addr, probe_echo_handle) =
+        echo_server::start_echo_server_on(probe_addr).await?;
+    let mut child = ChildGuard::new(spawn_meow(
+        &args.rust_binary,
+        &args.binary_arg,
+        &args.reload_config,
+    )?);
+
+    wait_for_port_guarded(
+        proxy_addr,
+        Duration::from_secs(10),
+        &mut child,
+        "reload proxy",
+    )
+    .await?;
+    wait_for_port_guarded(api_addr, Duration::from_secs(10), &mut child, "reload API").await?;
+    eprintln!("[reload] proxy + API ready");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let result = bench_reload::bench_reload(
+        bench_reload::ReloadTarget {
+            proxy: proxy_addr,
+            echo: echo_addr,
+            probe_addr,
+            api: api_addr,
+        },
+        &args.reload_config,
+        &alt_path,
+        args.duration,
+        args.concurrency,
+        args.reloads,
+    )
+    .await?;
+
+    child.shutdown().await;
+    echo_handle.abort();
+    probe_echo_handle.abort();
+    // Free the tempdir explicitly: `std::process::exit` below skips
+    // destructors and would leak it into /tmp.
+    drop(alt_dir);
+
+    let json = serde_json::to_string_pretty(&result)?;
+    if let Some(output_path) = &args.output {
+        std::fs::write(output_path, &json)?;
+        eprintln!("results written to {}", output_path.display());
+    } else {
+        println!("{json}");
+    }
+
+    // Hard failure signals: any rejected reload means the rebuild chain
+    // broke under load — that's a regression, not a measurement.  A
+    // datapath that fails verification (204s whose routing never landed),
+    // a datapath dead after commit, or a post-rate far below the
+    // pre-reload baseline are the same class of failure.
+    if result.reloads_ok < result.reloads_attempted
+        || result.datapath_verify_failures > 0
+        || (result.post_reload_conns_per_sec == 0.0 && result.post_reload_errors > 0)
+        || (result.pre_reload_conns_per_sec > 0.0
+            && result.post_reload_conns_per_sec < 0.5 * result.pre_reload_conns_per_sec)
+    {
         std::process::exit(1);
     }
     Ok(())
