@@ -27,9 +27,12 @@ after the boundary uses the new configuration.
 
 `connections_dropped` counts closure requests for registered TCP flows, not
 completed socket teardowns or rejected unregistered setups. UDP sessions are
-outside this boundary. Ordinary listener bindings/authentication and DNS
-runtime are not rebuilt by PUT; TUN reconciliation currently compares only
-`tun.enable`. These configuration-application gaps remain separate work.
+outside this boundary. Ordinary listener bindings/authentication are not
+rebuilt by PUT. The DNS runtime is republished when its inputs change
+(#514), and TUN reconciliation diffs the parsed `TunConfig` — an `enable`
+transition starts/stops the listener while any other semantic parameter
+change (or changed fake-IP inputs) restarts it (#543). Ordinary listener
+bindings remain separate work.
 
 ## Motivation
 
@@ -56,7 +59,11 @@ In scope:
 4. Immediately cancel registered TCP flows and reject older routing setups
    across one synchronized configuration-publication boundary.
 5. Response: `204 No Content` on success; `400 Bad Request` with error
-   message body on parse failure (when `?force=false`).
+   message body on parse failure (when `?force=false`). Two distinct
+   TUN failure contracts: an unparsable `tun:` section is a pre-commit
+   admission 400 (unless forced), while a post-commit spawn failure
+   still returns 204 with `tun.enable` rolled back in the stored raw
+   (#543).
 6. Auth: `require_auth` middleware — same as all other mutating REST endpoints.
 7. `GET /configs` — returns the currently active config as JSON (partial:
    returns the subset of fields exposed by existing `/configs` GET if it

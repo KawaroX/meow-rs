@@ -11,6 +11,7 @@ use parking_lot::RwLock;
 use smallvec::smallvec;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower::ServiceExt;
@@ -4009,4 +4010,555 @@ async fn put_configs_fetches_rule_provider_payload_once() {
         1,
         "one commit must fetch the provider payload exactly once"
     );
+}
+
+/// A stand-in live TUN listener whose pending task holds a drop flag:
+/// `stop_tun`'s abort drops the future, so `stopped` flips iff the
+/// handle was actually reaped — a spawn-independent "was restarted"
+/// probe (a *successful* respawn leaves `has_tun()` true either way,
+/// so post-state alone can't distinguish a no-op from a working
+/// restart under a privileged listener-tun build).
+fn fake_tun_handle() -> (meow_tunnel::TunHandle, Arc<std::sync::atomic::AtomicBool>) {
+    struct Flag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Flag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = meow_tunnel::TunHandle {
+        task: tokio::spawn({
+            let flag = Arc::clone(&flag);
+            async move {
+                let _flag = Flag(flag);
+                std::future::pending::<()>().await;
+            }
+        }),
+        core_done: None,
+    };
+    (handle, flag)
+}
+
+/// Issue #543: a `tun:` parameter change while `enable` stays true must
+/// restart the listener — previously only enable transitions (and, after
+/// #544, fake-IP input changes) reconciled, so committed `mtu`/
+/// `auto-route`/`dns-hijack`/address changes silently diverged from the
+/// running stack.
+///
+/// A pending task stands in for the live listener so the restart's
+/// `stop_tun` reaps a real slot; without the `listener-tun` feature
+/// `spawn_tun_from_raw` then fails, which rolls `tun.enable` back — the
+/// flip to `false` is observable proof the restart fired. A build *with*
+/// the feature exercises the same code path against a real spawn instead
+/// of this stub.
+#[cfg(not(feature = "listener-tun"))]
+#[tokio::test]
+async fn put_configs_tun_param_change_reconciles_running_listener() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+    assert!(state.tunnel.has_tun());
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "tun:\n",
+        "  enable: true\n",
+        "  mtu: 9000\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| !t.enable),
+        "the param-change restart must have fired and rolled `enable` back \
+         after the spawn failure — a silently ignored change would leave \
+         it true"
+    );
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the restart must reap the old listener handle"
+    );
+    assert!(
+        !state.tunnel.has_tun(),
+        "stop_tun must have reaped the listener slot, not just the flag"
+    );
+    // Committed-state contract: the new params persist — only `enable`
+    // rolls back (routes.rs doc).
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert_eq!(tun.mtu, Some(9000));
+}
+
+/// Companion invariant: a semantically identical `tun:` section must NOT
+/// restart — the committed config spells `mtu: 1500` explicitly while the
+/// candidate omits it (same parsed default), which the `TunConfig` diff
+/// treats as unchanged.
+#[tokio::test]
+async fn put_configs_tun_unchanged_does_not_reconcile() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "tun:\n",
+        "  enable: true\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n"
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| t.enable),
+        "an unchanged tun: section must not touch the listener"
+    );
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "the old handle must not be reaped — spawn-independent no-restart proof"
+    );
+    assert!(
+        state.tunnel.has_tun(),
+        "the fake handle must still be running"
+    );
+}
+
+/// A `tun:` section the listener cannot parse is rejected at admission —
+/// committing it would let the reconcile restart tear down a healthy
+/// listener before the spawn-side parse fails (issue #543 review).
+#[tokio::test]
+async fn put_configs_invalid_tun_rejected_before_commit() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+
+    // mtu below the IPv6 floor (1280) fails `parse_tun_config`.
+    let yaml = concat!(
+        "mode: rule\n",
+        "tun:\n",
+        "  enable: true\n",
+        "  mtu: 100\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("tun config error")),
+        "the 400 must come from the tun admission check, got: {body}"
+    );
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert_eq!(
+        (tun.enable, tun.mtu),
+        (true, Some(1500)),
+        "the invalid section must not have been committed"
+    );
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "the running listener must survive untouched"
+    );
+    assert!(state.tunnel.has_tun(), "the running listener must survive");
+}
+
+/// `?force` degrades the `tun:` admission check to a warn: the unparsable
+/// section commits, the reconcile restart hits the spawn-side parse
+/// error, and `enable` rolls back — a 204 that still tears the healthy
+/// listener down (deliberate force semantics, issue #543 review).
+/// Deterministic under both feature sets: `mtu: 100` fails
+/// `parse_tun_config` at spawn regardless of privileges.
+#[tokio::test]
+async fn put_configs_force_invalid_tun_commits_and_rolls_back() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "tun:\n",
+        "  enable: true\n",
+        "  mtu: 100\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs?force=true")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert_eq!(
+        (tun.enable, tun.mtu),
+        (false, Some(100)),
+        "the forced commit persists; only `enable` rolls back"
+    );
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the restart must reap the old handle"
+    );
+    assert!(!state.tunnel.has_tun());
+}
+
+/// Top-level `max-connections` is inherited into `TunConfig`, so changing
+/// it while TUN runs is a real parameter change (issue #543 review).
+#[cfg(not(feature = "listener-tun"))]
+#[tokio::test]
+async fn put_configs_max_connections_change_reconciles_tun() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "max-connections: 512\n",
+        "tun:\n",
+        "  enable: true\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        !state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| t.enable),
+        "the max-connections restart must have fired and rolled `enable` \
+         back after the spawn failure"
+    );
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the restart must reap the old listener handle"
+    );
+}
+
+/// off→on still takes the spawn arm — a fresh `enable: true` spawns; the
+/// no-feature spawn failure rolls `enable` back (gated: under the feature
+/// a privileged host could spawn a real device).
+#[cfg(not(feature = "listener-tun"))]
+#[tokio::test]
+async fn put_configs_tun_enable_on_attempts_spawn() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "tun:\n",
+        "  enable: true\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| !t.enable),
+        "off→on must spawn, and the no-feature failure must roll `enable` back"
+    );
+    assert!(
+        !state.tunnel.has_tun(),
+        "a failed spawn must leave no listener handle behind"
+    );
+}
+
+/// on→off still stops the listener: dropping the `tun:` section takes the
+/// stop arm. Deterministic under both feature sets — `stop_tun` needs no
+/// device.
+#[tokio::test]
+async fn put_configs_tun_enable_off_stops_listener() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+
+    let yaml = "mode: rule\nrules:\n  - MATCH,DIRECT\n";
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(state.raw_config.read().tun.is_none());
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the stop arm must reap the old listener handle"
+    );
+    assert!(
+        !state.tunnel.has_tun(),
+        "dropping the tun: section must stop the listener"
+    );
+}
+
+/// A missing handle does not suppress the reconcile: enabled + a real
+/// param change with no stored handle still attempts the respawn, and
+/// the failure rolls `enable` back — the deliberate no-`has_tun()`-gate
+/// semantics (issue #543 review).
+#[cfg(not(feature = "listener-tun"))]
+#[tokio::test]
+async fn put_configs_tun_param_change_without_handle_rolls_back() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "tun:\n",
+        "  enable: true\n",
+        "  mtu: 9000\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| !t.enable),
+        "the respawn attempt must roll `enable` back after the spawn failure"
+    );
+    assert!(
+        !state.tunnel.has_tun(),
+        "stop_tun must have reaped the listener slot, not just the flag"
+    );
+}
+
+/// `enable: false` → `enable: false` with a param change must NOT touch
+/// the listener slot — `old_enable` gates the restart arm. The live fake
+/// handle stands in for a listener that must not be stopped.
+#[tokio::test]
+async fn put_configs_tun_disabled_param_change_no_restart() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: false\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "tun:\n",
+        "  enable: false\n",
+        "  mtu: 9000\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "a disabled-section param change must not reap the handle"
+    );
+    assert!(
+        state.tunnel.has_tun(),
+        "a disabled-section param change must not reach the listener"
+    );
+}
+
+/// The fake-IP disjunct alone still fires the restart (issue #544 trigger
+/// preserved): an unchanged `tun:` section plus a `dns:` change that
+/// introduces fake-ip swaps the resolver and restarts the listener.
+#[cfg(not(feature = "listener-tun"))]
+#[tokio::test]
+async fn put_configs_tun_fake_ip_change_restarts_listener() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "dns:\n",
+        "  enable: true\n",
+        "  enhanced-mode: fake-ip\n",
+        "  nameserver:\n",
+        "    - 127.0.0.1\n",
+        "tun:\n",
+        "  enable: true\n",
+        "  mtu: 1500\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| !t.enable),
+        "the fake-IP restart must have fired and rolled `enable` back"
+    );
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the restart must reap the old listener handle"
+    );
+    assert!(
+        !state.tunnel.has_tun(),
+        "stop_tun must have reaped the listener slot, not just the flag"
+    );
+    assert!(state.tunnel.resolver().fake_ip_v4_net().is_some());
 }

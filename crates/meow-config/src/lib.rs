@@ -228,7 +228,7 @@ pub struct NamedListener {
 /// Parsed + validated `tun:` section (issue #326). Consumed by the app
 /// layer, which maps it onto `meow_listener::TunListenerConfig` when the
 /// `listener-tun` feature is compiled in.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunConfig {
     pub enable: bool,
     /// Device name; `None` = platform default.
@@ -295,7 +295,13 @@ pub fn parse_tun_config(
     global_max_connections: Option<usize>,
 ) -> Result<TunConfig, anyhow::Error> {
     let Some(r) = raw else {
-        return Ok(TunConfig::default());
+        // Keep the global-cap folding symmetric with the `Some` arm: an
+        // absent section still inherits `max-connections`, so callers
+        // diffing parsed configs see the same value either way.
+        return Ok(TunConfig {
+            max_connections: global_max_connections.unwrap_or(256),
+            ..TunConfig::default()
+        });
     };
 
     // Warn on upstream-only fields (Class B per ADR-0002; policy of #328:
@@ -384,6 +390,12 @@ pub fn parse_tun_config(
              ignored in fake-ip mode"
         );
     }
+    // Normalise the ignored value out: the commit path diffs parsed
+    // `TunConfig`s to decide on a restart, and a field that does nothing
+    // must not trigger one — a PUT touching only `outbound-interface`
+    // under fake-ip scope would otherwise bounce a healthy listener
+    // (issue #543 review).
+    let outbound_interface = outbound_interface.filter(|_| route_mode == TunRouteMode::Global);
 
     Ok(TunConfig {
         enable: r.enable,
