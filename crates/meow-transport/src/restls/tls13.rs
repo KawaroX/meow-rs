@@ -247,6 +247,11 @@ fn build_client_hello(
     Ok(hello)
 }
 
+/// Compat-CCS records tolerated while the cover's handshake flight is
+/// in progress — middlebox noise is legal but unbounded CCS spam is not
+/// (upstream bounds it via `maxUselessRecords`).
+const MAX_FLIGHT_CCS: u32 = 32;
+
 /// Signature algorithms offered for the cover's CertificateVerify.
 pub(crate) const SIG_ALGS: [u16; 8] = [
     0x0403, // ecdsa_secp256r1_sha256
@@ -375,6 +380,11 @@ async fn read_plain_handshake<R: AsyncRead + Unpin>(
         match record.typ {
             wire::TLS_RECORD_CHANGE_CIPHER_SPEC => {
                 *ccs += 1;
+                if *ccs > MAX_FLIGHT_CCS {
+                    return Err(TransportError::Tls(
+                        "restls: too many CCS records in server flight".into(),
+                    ));
+                }
                 continue;
             }
             wire::TLS_RECORD_HANDSHAKE => {
@@ -573,8 +583,14 @@ impl ServerFlightGuard {
                 self.cv_signature = take(&msg.body, &mut p, sig_len)?.to_vec();
             }
             HS_CERTIFICATE_REQUEST => {
-                if self.saw_certificate_request {
-                    return Err(TransportError::Tls("restls: duplicate CR".into()));
+                // Server flight order is EE → [CR] → Cert → CV → Fin —
+                // a CR outside that slot is malformed.
+                if !self.saw_encrypted_extensions
+                    || self.saw_certificate
+                    || self.saw_certificate_verify
+                    || self.saw_certificate_request
+                {
+                    return Err(TransportError::Tls("restls: unexpected CR".into()));
                 }
                 self.saw_certificate_request = true;
                 let mut p = 0;
@@ -613,6 +629,13 @@ pub(crate) fn parse_certificate_list(body: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(certs)
 }
 
+/// CV schemes legal in TLS 1.3 — `SIG_ALGS` minus PKCS#1 v1.5
+/// (`0x0401`/`0x0501`), which RFC 8446 §4.4.3 forbids in
+/// CertificateVerify even when offered in `signature_algorithms`.
+/// Anything never offered is rejected the same way — matching
+/// upstream's `isSupportedSignatureAlgorithm` gate.
+const TLS13_CV_SCHEMES: [u16; 6] = [0x0403, 0x0804, 0x0503, 0x0805, 0x0807, 0x0806];
+
 /// Verify the cover's CertificateVerify over the running transcript.
 fn verify_certificate_verify(
     cipher: CipherSuite,
@@ -621,6 +644,11 @@ fn verify_certificate_verify(
     leaf_der: &[u8],
     transcript: &[u8],
 ) -> Result<()> {
+    if !TLS13_CV_SCHEMES.contains(&scheme) {
+        return Err(TransportError::Tls(format!(
+            "restls: CV scheme 0x{scheme:04x} unoffered or illegal in TLS 1.3"
+        )));
+    }
     // TLS 1.3 CV content: 64×0x20 || "TLS 1.3, server CertificateVerify" || 0x00 || transcript_hash.
     let mut content = Vec::with_capacity(64 + 34 + 64);
     content.extend_from_slice(&[0x20u8; 64]);
@@ -1263,10 +1291,8 @@ where
     transcript.extend_from_slice(&hello);
     let our_sid = hello[39..71].to_vec();
 
-    // Upstream's `expectServerAuth` unmask path requires exactly one
-    // inbound cipher change — a second CCS disables the masked-record
-    // probe permanently. CCS records arriving before the ServerHello
-    // count too.
+    // Stray pre-handshake CCS is legal middlebox noise — count it only
+    // to bound the streak.
     let mut server_ccs = 0u32;
     let server_hello = read_plain_handshake(&mut inner, HS_SERVER_HELLO, &mut server_ccs).await?;
     let parsed = parse_server_hello(&server_hello)?;
@@ -1298,6 +1324,11 @@ where
             .ok_or_else(|| TransportError::Tls("restls: EOF in server flight".into()))?;
         if record.typ == wire::TLS_RECORD_CHANGE_CIPHER_SPEC {
             server_ccs += 1;
+            if server_ccs > MAX_FLIGHT_CCS {
+                return Err(TransportError::Tls(
+                    "restls: too many CCS records in server flight".into(),
+                ));
+            }
             continue;
         }
         if record.typ != wire::TLS_RECORD_APPLICATION_DATA {
@@ -1311,7 +1342,12 @@ where
 
         if authed.is_none() {
             authed = Some(false);
-            let (typ, body) = if server_ccs == 1 {
+            // Upstream probes the mask on the first encrypted record
+            // whenever the server installed its handshake cipher exactly
+            // once (`numCipherChange` counts cipher installations — not
+            // CCS records). Probe unconditionally: a cover emitting zero
+            // or several compat CCS records must not skip it.
+            let (typ, body) = {
                 let (unmasked, _) = wire::unmask_server_auth(&full, secret, &server_random, false);
                 match server_hs.open(&unmasked[..5].try_into().expect("header"), &unmasked[5..]) {
                     Ok((typ, body)) => {
@@ -1320,8 +1356,6 @@ where
                     }
                     Err(_) => server_hs.open(&record.header, &record.payload)?,
                 }
-            } else {
-                server_hs.open(&record.header, &record.payload)?
             };
             if typ != wire::TLS_RECORD_HANDSHAKE {
                 return Err(TransportError::Tls(if authed == Some(true) {
@@ -1439,5 +1473,24 @@ where
         gcm_ctr_disabled: false,
         // TLS 1.3 nonces are IV-derived — no explicit slot to rewrite.
         gcm_next_seq: 0,
+        cover_hs_pending: handshake_buf.into_iter().collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 1.3 CV gate is exactly the offered list minus the PKCS#1
+    /// v1.5 schemes — stricter than upstream's default-list check, and
+    /// RFC 8446 §4.4.3-correct (CV must be a scheme we offered).
+    #[test]
+    fn cv_schemes_are_offered_minus_v15() {
+        for s in TLS13_CV_SCHEMES {
+            assert!(SIG_ALGS.contains(&s), "{s:#06x} gated but never offered");
+        }
+        assert!(!TLS13_CV_SCHEMES.contains(&0x0401));
+        assert!(!TLS13_CV_SCHEMES.contains(&0x0501));
+        assert_eq!(TLS13_CV_SCHEMES.len(), SIG_ALGS.len() - 2);
+    }
 }
