@@ -291,6 +291,31 @@ mod tests {
         assert!(!specs[0].lazy);
     }
 
+    /// Issue #555: `select`/`relay` accept `url`/`interval`/`lazy` in the
+    /// flat `RawProxyGroup` shape but never run probes — even when the
+    /// fields are set explicitly, no spec may be emitted.  Upstream
+    /// sweeps static members of every group type (mihomo `90bf158`);
+    /// meow warns at parse instead (Class B, ADR-0002).
+    #[test]
+    fn extract_specs_skips_select_and_relay_with_health_fields() {
+        for group_type in ["select", "relay"] {
+            let g = meow_config::raw::RawProxyGroup {
+                name: "g".into(),
+                group_type: group_type.into(),
+                url: Some("https://example.com/204".into()),
+                interval: Some(60),
+                lazy: Some(true),
+                tolerance: Some(100),
+                expected_status: Some("204".into()),
+                ..Default::default()
+            };
+            assert!(
+                extract_specs(&[g]).is_empty(),
+                "{group_type} with health fields must not emit a probe spec"
+            );
+        }
+    }
+
     /// A task that died on its own is restarted at the next reconcile.
     #[tokio::test]
     async fn reconcile_restarts_dead_tasks() {
@@ -688,6 +713,50 @@ mod tests {
         until(Duration::from_secs(5), || a.dials() >= 1 && b.dials() >= 1).await;
         assert_eq!(a.dials(), 1, "immediate first tick probes unused members");
         assert!(a.last_delay() >= 1);
+
+        task.abort();
+    }
+
+    /// Issue #555: `expected-status` on a `load-balance` group must reach
+    /// the sweep — a canned 204 answer against `expected_status("200")`
+    /// marks the member dead. Without the `with_expected_status` wiring
+    /// the probe would accept the default range and the member would
+    /// stay alive, so this fails if the plumbing is reverted.
+    #[tokio::test(start_paused = true)]
+    async fn lb_expected_status_reaches_probe() {
+        let tunnel = stub_tunnel();
+        let a = ProbeMock::named("a");
+        let group = std::sync::Arc::new(
+            meow_proxy::group::load_balance::LoadBalanceGroup::new(
+                "lb",
+                vec![std::sync::Arc::clone(&a) as std::sync::Arc<dyn Proxy>],
+                meow_proxy::group::load_balance::LbStrategy::RoundRobin,
+            )
+            .with_expected_status("200".to_string()),
+        );
+
+        let mut proxies: HashMap<smol_str::SmolStr, std::sync::Arc<dyn Proxy>> = HashMap::new();
+        proxies.insert("a".into(), std::sync::Arc::<ProbeMock>::clone(&a));
+        proxies.insert(
+            "lb".into(),
+            std::sync::Arc::<meow_proxy::group::load_balance::LoadBalanceGroup>::clone(&group),
+        );
+        tunnel.update_proxies(proxies, Default::default());
+
+        let spec = HealthCheckSpec {
+            group_name: "lb".into(),
+            url: "http://probe.test/204".into(),
+            interval_secs: 1,
+            lazy: false,
+        };
+        let task = tokio::spawn(run_health_check_loop(Arc::downgrade(tunnel.inner()), spec));
+
+        until(Duration::from_secs(5), || a.dials() >= 1).await;
+        assert!(
+            !a.alive(),
+            "expected-status '200' must reject the canned 204 — member dead"
+        );
+        assert_eq!(a.last_delay(), 0, "failed probe records delay 0");
 
         task.abort();
     }
