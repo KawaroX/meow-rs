@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub(crate) async fn spawn_blocking_with_current_dispatcher<F, R>(
     f: F,
@@ -661,6 +661,14 @@ pub fn rebuild_from_raw_runtime(
     cache_dir: Option<&Path>,
 ) -> Result<RebuildResult, anyhow::Error> {
     let store = meow_proxy::SelectorStore::global();
+    if store.is_none() {
+        // First-`open`-wins binds the global at startup; embedders that
+        // never call `SelectorStore::open` (e.g. `load_config_from_str`)
+        // get the unpersisted behavior — selections reset on rebuild.
+        debug!(
+            "rebuild_from_raw_runtime: no global SelectorStore; group selections will not persist"
+        );
+    }
     rebuild_from_raw_impl(
         raw,
         cache_dir,
@@ -5014,8 +5022,8 @@ rules:
         )
         .unwrap();
 
-        // `rebuild_from_raw_with_resolver` — used by subscription_refresh
-        // and geodata_fetch.
+        // `rebuild_from_raw_with_resolver` — used by geodata_fetch's
+        // rules-only rebuilds.
         let result =
             rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
                 .expect(
@@ -5024,7 +5032,7 @@ rules:
         assert_eq!(result.rules.len(), 2);
 
         // `rebuild_from_raw_runtime` — used by meow-api's `PUT /configs`
-        // family via `rebuild_from_raw_with_resolver_async`.
+        // family via `rebuild_from_raw_runtime_async`.
         let result = rebuild_from_raw_runtime(&raw, None, &HashMap::new(), Some(dir.path()))
             .expect(
             "trusted runtime rebuild with the real cache dir must not hard-fail on a file provider",
