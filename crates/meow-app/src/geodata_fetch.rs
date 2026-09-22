@@ -89,11 +89,71 @@ pub async fn fetch_missing(
     downloaded
 }
 
+/// Reparse + republish the resolver after the geo DB files changed. The
+/// raw config is unchanged, so `reconcile_dns_config`'s
+/// old-vs-candidate gate would call this a no-op for `geosite:`-only
+/// policies — parse and publish directly. The DNS rebuild borrows the
+/// same routing rebuild's provider map (the live registry generation
+/// these rules bind); no payload snapshot exists to forward — a shared
+/// rebuild never prefetches (issue #543). A parse failure warns and
+/// keeps the running resolver — the rules commit proceeds regardless.
+///
+/// `#name` upstreams bind the LIVE route's proxies and dialer registry,
+/// not `rebuild`'s: a rules-only rebuild publishes into a transient
+/// `ProxyRegistry` cell that `update_rules` never installs, so adapters
+/// captured from `rebuild.proxies` would hold a dangling
+/// `Weak<RegistryCell>` (and groups a stateless duplicate) once
+/// `rebuild` drops.
+///
+/// The parse runs on a spawned task so a panic unwinds into a
+/// `JoinError` we can warn-and-continue on — a panic inside the loop
+/// task would silently kill auto-update until restart.
+async fn republish_dns_for_geo_dbs(
+    raw: &RawConfig,
+    cache_dir: &std::path::Path,
+    rebuild: &meow_config::RebuildResult,
+    tunnel: &Tunnel,
+    dns_server: &RwLock<Option<meow_api::routes::DnsServerHandle>>,
+    label: &str,
+) {
+    let raw = raw.clone();
+    let cache_dir = cache_dir.to_path_buf();
+    let providers = rebuild.rule_providers.clone();
+    let prior = tunnel.resolver();
+    let route = tunnel.route_snapshot();
+    let parsed = tokio::spawn(async move {
+        meow_config::parse_dns_from_raw(
+            &raw,
+            Some(&cache_dir),
+            &route.proxies,
+            Some(&providers),
+            None,
+            Some(prior.as_ref()),
+            Some(&route.dialer_registry),
+        )
+        .await
+    })
+    .await;
+    match parsed {
+        Ok(Ok(dns)) => meow_api::routes::publish_dns(tunnel, dns_server, dns).await,
+        Ok(Err(e)) => warn!("{label}: dns republish skipped: {e:#}"),
+        Err(e) => warn!("{label}: dns republish task failed: {e}"),
+    }
+}
+
 /// Startup-fetch entry point: download any geodata DB whose target file does
 /// not yet exist, then rebuild rules so the freshly-downloaded DBs take
 /// effect without a restart. Independent of `geodata.auto-update` — the goal
 /// is "if the file is missing when meow boots, fetch it so rules work on
 /// first run." Safe to spawn as a background task.
+///
+/// `rule_providers` must be the same shared registry `ApiServer` holds —
+/// a private `RwLock` would fork the API-visible provider set. The
+/// rebuild binds those live provider objects rather than replacing the
+/// registry, so no supervisor reconcile is needed here. `dns_server` is
+/// the shared DNS-server handle — after a DB download the resolver is
+/// reparsed and republished so `geosite:`/`rule-set:` policy matchers
+/// bind the new DB generation (issue #543).
 pub async fn run_on_startup(
     geo: GeoDataConfig,
     tunnel: Tunnel,
@@ -102,6 +162,7 @@ pub async fn run_on_startup(
     // Live proxy providers — group `use:` names resolve against them;
     // an empty map fails every `use:` group under `strict: true`.
     proxy_providers: Arc<dashmap::DashMap<String, Arc<ProxyProvider>>>,
+    dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>>,
     cache_dir: PathBuf,
 ) {
     let targets = compute_targets(&geo);
@@ -128,6 +189,7 @@ pub async fn run_on_startup(
     let resolver = tunnel.resolver_slot();
     let rebuild = tokio::task::spawn_blocking({
         let cache_dir = cache_dir.clone();
+        let raw = raw.clone();
         let rule_providers = Arc::clone(&rule_providers);
         let proxy_providers: std::collections::HashMap<_, _> = proxy_providers
             .iter()
@@ -152,8 +214,28 @@ pub async fn run_on_startup(
     })
     .await;
     match rebuild {
-        Ok(Ok(result)) => {
-            tunnel.update_rules(result.rules);
+        Ok(Ok(rebuild)) => {
+            // Republish the resolver so `geosite:`/`rule-set:` policy
+            // matchers bind the DB generation this commit loads — the raw
+            // config is unchanged, so the reconcile gate would skip it.
+            // The DNS parse borrows the rebuild's (live) provider map
+            // (issue #543).
+            republish_dns_for_geo_dbs(
+                &raw,
+                &cache_dir,
+                &rebuild,
+                &tunnel,
+                &dns_server,
+                "geodata startup-fetch",
+            )
+            .await;
+            tunnel.update_rules(rebuild.rules);
+            // No registry swap or supervisor reconcile: the rebuild bound
+            // the live provider objects, so the map is unchanged and every
+            // interval task is already supervised. Known limitation:
+            // provider payloads embed geo entries parsed against the
+            // provider's load-time ctx — a DB arriving via this fetch only
+            // reaches them at the next full config commit.
             info!("geodata startup-fetch: rules reloaded with downloaded DBs");
         }
         Ok(Err(e)) => warn!(
@@ -169,8 +251,9 @@ pub async fn run_on_startup(
 
 /// Background task that periodically re-downloads the ASN and geosite DBs
 /// when `geodata.auto-update: true`. After each successful download the DB
-/// file is atomically replaced on disk, then rules are rebuilt in memory
-/// without restart. Runs forever; spawn as a background task.
+/// file is atomically replaced on disk, then rules are rebuilt and the DNS
+/// resolver republished (same helper as `run_on_startup`) — all without
+/// restart. Runs forever; spawn as a background task.
 ///
 /// The GeoIP MMDB is intentionally NOT refreshed here — country-code → CIDR
 /// mappings change infrequently and skipping the rebuild keeps the
@@ -180,6 +263,9 @@ pub async fn run_on_startup(
 /// The tunnel is captured weakly (issue #514): an embedder that drops
 /// every `Tunnel` handle stops this loop at the next tick instead of
 /// pinning `TunnelInner` forever.
+///
+/// See [`run_on_startup`] for the `rule_providers` / `proxy_providers` /
+/// `dns_server` sharing contract.
 pub async fn auto_update_loop(
     geo: GeoDataConfig,
     tunnel: Tunnel,
@@ -187,10 +273,15 @@ pub async fn auto_update_loop(
     rule_providers: Arc<RwLock<std::collections::HashMap<String, Arc<RuleProvider>>>>,
     // Same contract as `run_on_startup` — the live provider registry.
     proxy_providers: Arc<dashmap::DashMap<String, Arc<ProxyProvider>>>,
+    dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>>,
     cache_dir: PathBuf,
 ) {
     let interval = std::time::Duration::from_secs(geo.auto_update_interval as u64 * 3600);
     let mut ticker = tokio::time::interval(interval);
+    // After a suspend longer than the interval, tick once per loop turn
+    // rather than bursting every missed slot (same policy as the
+    // rule-provider refresh supervisor).
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await; // skip the immediate first tick
 
     let weak = tunnel.weak_inner();
@@ -214,82 +305,126 @@ pub async fn auto_update_loop(
         };
         let tunnel = Tunnel::from_inner(inner);
 
-        let mut any_updated = false;
-
-        let route = tunnel.route_snapshot();
-        let proxies = &route.proxies;
-        let download_proxy = meow_config::internal_http::first_named_proxy(
-            raw_config.read().proxies.as_deref(),
-            proxies,
-        );
-
-        if let Err(e) =
-            download_and_replace(&geo.asn_url, &asn_target, download_proxy.as_ref()).await
-        {
-            warn!("geodata auto-update: ASN MMDB download failed: {:#}", e);
-        } else {
-            any_updated = true;
-        }
-
-        if let Err(e) =
-            download_and_replace(&geo.geosite_url, &geosite_target, download_proxy.as_ref()).await
-        {
-            warn!("geodata auto-update: geosite download failed: {:#}", e);
-        } else {
-            any_updated = true;
-        }
-
-        if !any_updated {
-            warn!("geodata auto-update: all downloads failed; rules not reloaded");
-            continue;
-        }
-
-        // Serialize against config commits and rebuild from the raw
-        // committed *inside* the lane — otherwise this rebuild could
-        // revert rules committed by a concurrent PUT (issue #514).
-        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
-        let raw = raw_config.read().clone();
-        // Share the tunnel's resolver slot so the rebuilt DIRECT adapter
-        // tracks later `set_resolver` swaps (issue #514).
-        let resolver = tunnel.resolver_slot();
-        let rebuild = tokio::task::spawn_blocking({
-            let cache_dir = cache_dir.clone();
-            let rule_providers = Arc::clone(&rule_providers);
-            let proxy_providers: std::collections::HashMap<_, _> = proxy_providers
-                .iter()
-                .map(|e| (e.key().clone(), Arc::clone(e.value())))
-                .collect();
-            move || {
-                meow_config::rebuild_from_raw_with_resolver(
-                    &raw,
-                    Some(&resolver),
-                    Some(cache_dir.as_path()),
-                    &proxy_providers,
-                    // Rules-only refresh — bind the rebuilt RULE-SET rules
-                    // to the LIVE provider set so API/provider refreshes
-                    // keep reaching them (issue #533 review).
-                    Some(rule_providers.read().clone()),
-                )
-            }
-        })
+        auto_update_tick(
+            &geo,
+            &tunnel,
+            &raw_config,
+            Arc::clone(&rule_providers),
+            &proxy_providers,
+            &dns_server,
+            &cache_dir,
+            &asn_target,
+            &geosite_target,
+        )
         .await;
-        match rebuild {
-            Ok(Ok(result)) => {
-                tunnel.update_rules(result.rules);
-                info!("geodata auto-update: rules reloaded with updated DBs");
-            }
-            Ok(Err(e)) => {
-                warn!(
-                    "geodata auto-update: rule rebuild failed after DB download: {:#}",
-                    e
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "geodata auto-update: rule rebuild task failed after DB download: {}",
-                    e
-                );
-            }
+    }
+}
+
+/// One auto-update round: download both DBs (each failure is logged and
+/// skipped — a partial update still commits), then serialize through the
+/// config lane to rebuild rules and republish the resolver. Split out of
+/// `auto_update_loop` so the orchestration is directly testable without
+/// driving the ticker (issue #543 review).
+#[allow(clippy::too_many_arguments)]
+async fn auto_update_tick(
+    geo: &GeoDataConfig,
+    tunnel: &Tunnel,
+    raw_config: &RwLock<RawConfig>,
+    rule_providers: Arc<RwLock<std::collections::HashMap<String, Arc<RuleProvider>>>>,
+    proxy_providers: &dashmap::DashMap<String, Arc<ProxyProvider>>,
+    dns_server: &RwLock<Option<meow_api::routes::DnsServerHandle>>,
+    cache_dir: &std::path::Path,
+    asn_target: &std::path::Path,
+    geosite_target: &std::path::Path,
+) {
+    let mut any_updated = false;
+
+    let route = tunnel.route_snapshot();
+    let proxies = &route.proxies;
+    let download_proxy = meow_config::internal_http::first_named_proxy(
+        raw_config.read().proxies.as_deref(),
+        proxies,
+    );
+
+    if let Err(e) = download_and_replace(&geo.asn_url, asn_target, download_proxy.as_ref()).await {
+        warn!("geodata auto-update: ASN MMDB download failed: {:#}", e);
+    } else {
+        any_updated = true;
+    }
+
+    if let Err(e) =
+        download_and_replace(&geo.geosite_url, geosite_target, download_proxy.as_ref()).await
+    {
+        warn!("geodata auto-update: geosite download failed: {:#}", e);
+    } else {
+        any_updated = true;
+    }
+
+    if !any_updated {
+        warn!("geodata auto-update: all downloads failed; rules not reloaded");
+        return;
+    }
+
+    // Serialize against config commits and rebuild from the raw
+    // committed *inside* the lane — otherwise this rebuild could
+    // revert rules committed by a concurrent PUT (issue #514).
+    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+    let raw = raw_config.read().clone();
+    // Share the tunnel's resolver slot so the rebuilt DIRECT adapter
+    // tracks later `set_resolver` swaps (issue #514).
+    let resolver = tunnel.resolver_slot();
+    let rebuild = tokio::task::spawn_blocking({
+        let cache_dir = cache_dir.to_path_buf();
+        let raw = raw.clone();
+        let rule_providers = Arc::clone(&rule_providers);
+        let proxy_providers: std::collections::HashMap<_, _> = proxy_providers
+            .iter()
+            .map(|e| (e.key().clone(), Arc::clone(e.value())))
+            .collect();
+        move || {
+            meow_config::rebuild_from_raw_with_resolver(
+                &raw,
+                Some(&resolver),
+                Some(cache_dir.as_path()),
+                &proxy_providers,
+                // Rules-only refresh — bind the rebuilt RULE-SET rules
+                // to the LIVE provider set so API/provider refreshes
+                // keep reaching them (issue #533 review).
+                Some(rule_providers.read().clone()),
+            )
+        }
+    })
+    .await;
+    match rebuild {
+        Ok(Ok(rebuild)) => {
+            // Same ordering as the startup path — republish the
+            // resolver so policy matchers bind the new DB generation,
+            // then swap the rules. No registry write or reconcile:
+            // the rebuild bound the live provider objects (issue
+            // #543).
+            republish_dns_for_geo_dbs(
+                &raw,
+                cache_dir,
+                &rebuild,
+                tunnel,
+                dns_server,
+                "geodata auto-update",
+            )
+            .await;
+            tunnel.update_rules(rebuild.rules);
+            info!("geodata auto-update: rules reloaded with updated DBs");
+        }
+        Ok(Err(e)) => {
+            warn!(
+                "geodata auto-update: rule rebuild failed after DB download: {:#}",
+                e
+            );
+        }
+        Err(e) => {
+            warn!(
+                "geodata auto-update: rule rebuild task failed after DB download: {}",
+                e
+            );
         }
     }
 }
@@ -297,6 +432,7 @@ pub async fn auto_update_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn cfg_with_paths(
         mmdb: Option<&str>,
@@ -375,5 +511,508 @@ mod tests {
         );
         // Files are unchanged.
         assert_eq!(std::fs::read(&mmdb).unwrap(), b"existing-mmdb");
+    }
+
+    /// Issue #543 — after the geo DB files change, the resolver must be
+    /// republished even though the raw config is unchanged
+    /// (`dns_inputs_equal` would call it a no-op). Observable as a new
+    /// resolver generation on the tunnel.
+    #[tokio::test]
+    async fn republish_dns_for_geo_dbs_swaps_resolver_generation() {
+        let raw: RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  nameserver:\n    - 127.0.0.1\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        let resolver = Arc::new(meow_dns::Resolver::new(
+            vec!["127.0.0.1:53".parse().unwrap()],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            true,
+            true,
+        ));
+        let tunnel = Tunnel::new(resolver);
+        let before = tunnel.resolver();
+        let dir = tempfile::tempdir().unwrap();
+        let rebuild = meow_config::rebuild_from_raw_with_resolver(
+            &raw,
+            Some(&tunnel.resolver_slot()),
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
+            Arc::new(RwLock::new(None));
+
+        republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
+
+        assert!(
+            !Arc::ptr_eq(&before, &tunnel.resolver()),
+            "a geo-DB refresh must republish the resolver generation"
+        );
+        // `publish_dns` installs the process-global host resolver for an
+        // enabled `dns:` section — clear it so sibling tests observe a
+        // clean global.
+        meow_common::clear_host_resolver();
+    }
+
+    /// Issue #543 — the republish must reach a RUNNING standalone DNS
+    /// server: `publish_dns` writes the rebuilt resolver into the
+    /// handle's shared slot so the live `dns.listen` socket serves the
+    /// new generation without a rebind.
+    #[tokio::test]
+    async fn republish_dns_for_geo_dbs_swaps_live_server_slot() {
+        let raw: RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  listen: 127.0.0.1:0\n  nameserver:\n    - 127.0.0.1\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        let resolver = Arc::new(meow_dns::Resolver::new(
+            vec!["127.0.0.1:53".parse().unwrap()],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            true,
+            true,
+        ));
+        let tunnel = Tunnel::new(resolver);
+        let dir = tempfile::tempdir().unwrap();
+        let rebuild = meow_config::rebuild_from_raw_with_resolver(
+            &raw,
+            Some(&tunnel.resolver_slot()),
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+
+        let stale = Arc::new(meow_dns::Resolver::new(
+            vec!["127.0.0.1:53".parse().unwrap()],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            true,
+            true,
+        ));
+        let slot = meow_dns::new_resolver_slot(Arc::clone(&stale));
+        // A live (never-finished) serve task keeps `publish_dns` on the
+        // in-place slot-swap path rather than a rebind.
+        let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
+            Arc::new(RwLock::new(Some(meow_api::routes::DnsServerHandle {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                task: tokio::spawn(std::future::pending::<()>()),
+                resolver_slot: Arc::clone(&slot),
+            })));
+
+        republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
+
+        assert!(
+            !Arc::ptr_eq(&stale, &slot.read()),
+            "the running server's slot must leave the stale generation"
+        );
+        assert!(
+            Arc::ptr_eq(&slot.read(), &tunnel.resolver()),
+            "server slot and tunnel must hold the same rebuilt resolver"
+        );
+        meow_common::clear_host_resolver();
+    }
+
+    /// Issue #543 — the republished resolver must bind the NEW geosite DB,
+    /// not merely be a fresh `Arc`. A `geosite:` nameserver-policy that
+    /// missed under the old DB generation must start routing to its
+    /// policy upstream once the DB containing the domain is in place.
+    /// `rcode://` upstreams answer a fixed rcode with no I/O and record
+    /// their label as the cache entry's `source`, which makes the tier
+    /// that answered observable through `dns_results`.
+    #[tokio::test]
+    async fn republish_dns_for_geo_dbs_binds_new_geosite_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let geosite_path = dir.path().join("geosite.mrs");
+        // v1: the category exists but does not contain the probe domain —
+        // the policy matcher is built yet never fires, the exact shape a
+        // stale generation leaves behind.
+        let v1 = meow_rules::mrs_parser::GeositePayload {
+            categories: vec![("testcat".to_string(), vec!["other.example".to_string()])],
+        };
+        std::fs::write(
+            &geosite_path,
+            meow_rules::mrs_parser::write_geosite_mrs(&v1).unwrap(),
+        )
+        .unwrap();
+
+        let raw: RawConfig = serde_yaml::from_str(&format!(
+            "geodata:\n  geosite-path: '{}'\n\
+             dns:\n  enable: true\n  nameserver:\n    - rcode://success\n  \
+             nameserver-policy:\n    \"geosite:testcat\": rcode://name_error\n\
+             rules:\n  - MATCH,DIRECT\n",
+            geosite_path.display()
+        ))
+        .unwrap();
+
+        // The "before" generation is bound to v1 via the same parse path.
+        let before_dns = meow_config::parse_dns_from_raw(
+            &raw,
+            Some(dir.path()),
+            &HashMap::new(),
+            Some(&HashMap::new()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let tunnel = Tunnel::new(Arc::clone(&before_dns.resolver));
+        let before = tunnel.resolver();
+
+        tunnel.resolver().lookup_ipv4("hit.example").await;
+        let results = tunnel.resolver().dns_results(Some("hit.example"), 1);
+        let source = results.first().and_then(|e| e.source.as_deref());
+        assert_eq!(
+            source,
+            Some("rcode:NoError"),
+            "v1 lacks the probe domain → the main upstream must answer"
+        );
+
+        // The refresh lands: v2 contains the probe domain.
+        let v2 = meow_rules::mrs_parser::GeositePayload {
+            categories: vec![("testcat".to_string(), vec!["hit.example".to_string()])],
+        };
+        std::fs::write(
+            &geosite_path,
+            meow_rules::mrs_parser::write_geosite_mrs(&v2).unwrap(),
+        )
+        .unwrap();
+        let rebuild = meow_config::rebuild_from_raw_with_resolver(
+            &raw,
+            Some(&tunnel.resolver_slot()),
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
+            Arc::new(RwLock::new(None));
+        republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
+
+        assert!(!Arc::ptr_eq(&before, &tunnel.resolver()));
+        tunnel.resolver().lookup_ipv4("hit.example").await;
+        let results = tunnel.resolver().dns_results(Some("hit.example"), 1);
+        let source = results.first().and_then(|e| e.source.as_deref());
+        assert_eq!(
+            source,
+            Some("rcode:NXDomain"),
+            "the republished resolver must bind the v2 geosite generation"
+        );
+        meow_common::clear_host_resolver();
+    }
+
+    /// Issue #543 — a DNS parse failure warns and keeps the running
+    /// resolver; the routing commit above is not rolled back
+    /// (`rule-set:gone` has no declared provider → deterministic `Err`).
+    #[tokio::test]
+    async fn republish_dns_for_geo_dbs_parse_failure_keeps_resolver() {
+        let raw: RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  nameserver:\n    - rcode://success\n  \
+             nameserver-policy:\n    \"rule-set:gone\": rcode://success\n\
+             rules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        let resolver = Arc::new(meow_dns::Resolver::new(
+            vec!["127.0.0.1:53".parse().unwrap()],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            true,
+            true,
+        ));
+        let tunnel = Tunnel::new(resolver);
+        let before = tunnel.resolver();
+        let dir = tempfile::tempdir().unwrap();
+        let rebuild = meow_config::rebuild_from_raw_with_resolver(
+            &raw,
+            Some(&tunnel.resolver_slot()),
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
+            Arc::new(RwLock::new(None));
+
+        republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
+
+        assert!(
+            Arc::ptr_eq(&before, &tunnel.resolver()),
+            "a failed DNS rebuild must keep the running resolver"
+        );
+    }
+
+    /// Issue #543 — `prior_resolver` carries the fake-IP pool across the
+    /// republish so clients holding `host → fake-ip` answers keep valid
+    /// reverse mappings (a `None` regression would silently strand them).
+    #[tokio::test]
+    async fn republish_dns_for_geo_dbs_preserves_fake_ip_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw: RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  \
+             fake-ip-range: 198.18.0.1/16\n  nameserver:\n    - rcode://success\n\
+             rules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        let before_dns = meow_config::parse_dns_from_raw(
+            &raw,
+            Some(dir.path()),
+            &HashMap::new(),
+            Some(&HashMap::new()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let tunnel = Tunnel::new(Arc::clone(&before_dns.resolver));
+        let before = tunnel.resolver();
+        let net = before
+            .fake_ip_v4_net()
+            .expect("fake-ip mode gives a v4 net");
+        let pool = before
+            .fakeip_pool_over(net)
+            .expect("fake-ip resolver holds a pool");
+
+        let rebuild = meow_config::rebuild_from_raw_with_resolver(
+            &raw,
+            Some(&tunnel.resolver_slot()),
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
+            Arc::new(RwLock::new(None));
+        republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
+
+        let after = tunnel.resolver();
+        assert!(
+            Arc::ptr_eq(&pool, &after.fakeip_pool_over(net).unwrap()),
+            "the republished resolver must reuse the prior fake-IP pool"
+        );
+        meow_common::clear_host_resolver();
+    }
+
+    /// `#name` upstreams must bind the LIVE route's proxies — a rules-only
+    /// rebuild publishes into a transient `ProxyRegistry` that
+    /// `update_rules` never installs, so adapters captured from
+    /// `rebuild.proxies` would hold a dangling `Weak<RegistryCell>` once
+    /// `rebuild` drops (issue #543 review).
+    #[tokio::test]
+    async fn republish_dns_binds_live_registry_cell_not_transient_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        // Both proxies are `type: direct` so the chained dial completes a
+        // real loopback TCP connection when the front hop resolves.
+        let raw: RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  nameserver:\n    - \"tcp://127.0.0.1:9#chained\"\n\
+             proxies:\n  - {name: hop, type: direct}\n  \
+             - {name: chained, type: direct, dialer-proxy: hop}\n\
+             rules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+
+        // The committed generation: installed on the route table, which
+        // retains its registry cell for the route's lifetime.
+        let committed = meow_config::rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let before_dns = meow_config::parse_dns_from_raw(
+            &raw,
+            Some(dir.path()),
+            &committed.proxies,
+            Some(&committed.rule_providers),
+            Some(&committed.prefetched_payloads),
+            None,
+            Some(&committed.dialer_registry),
+        )
+        .await
+        .unwrap();
+        let tunnel = Tunnel::new(Arc::clone(&before_dns.resolver));
+        tunnel.update_routing(
+            committed.proxies,
+            committed.rules,
+            committed.dialer_registry,
+        );
+
+        // The geodata rebuild — its proxy map and dialer-registry cell are
+        // transient: `update_rules` never installs them.
+        let rebuild = meow_config::rebuild_from_raw_with_resolver(
+            &raw,
+            Some(&tunnel.resolver_slot()),
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
+            Arc::new(RwLock::new(None));
+        republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
+        drop(rebuild);
+
+        // A dial through the captured `#chained` upstream resolves `hop`
+        // via the live route's retained cell. A dead cell would fail with
+        // "registry generation dropped"; a live one reaches the listener.
+        let resolver = tunnel.resolver();
+        let proxy = resolver
+            .main_nameservers()
+            .iter()
+            .find_map(|c| c.proxy().cloned())
+            .expect("the #chained upstream must be proxied");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let meta = meow_common::Metadata {
+            host: "127.0.0.1".into(),
+            dst_port: port,
+            ..Default::default()
+        };
+        proxy
+            .dial_tcp(&meta)
+            .await
+            .expect("the republished resolver's #chained adapter must resolve its front hop");
+        meow_common::clear_host_resolver();
+    }
+
+    /// Issue #543 — the periodic tick itself (not just the startup path)
+    /// must republish the resolver: `auto_update_loop`'s per-tick body is
+    /// `auto_update_tick`, exercised here directly so no ticker timing is
+    /// involved. A stale geosite generation misses the probe domain
+    /// before the tick and answers it afterwards.
+    #[tokio::test]
+    async fn auto_update_tick_republishes_resolver_with_new_geosite() {
+        // Origin serving the v2 geosite containing the probe domain.
+        let v2 = meow_rules::mrs_parser::GeositePayload {
+            categories: vec![("testcat".to_string(), vec!["hit.example".to_string()])],
+        };
+        let body = meow_rules::mrs_parser::write_geosite_mrs(&v2).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                use std::io::{Read, Write};
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !stop.load(std::sync::atomic::Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
+                            let _ =
+                                stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                            let mut buf = [0_u8; 2048];
+                            let _ = stream.read(&mut buf);
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(&body);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let geosite_path = dir.path().join("geosite.mrs");
+        // v1 on disk: the category exists but misses the probe domain.
+        let v1 = meow_rules::mrs_parser::GeositePayload {
+            categories: vec![("testcat".to_string(), vec!["other.example".to_string()])],
+        };
+        std::fs::write(
+            &geosite_path,
+            meow_rules::mrs_parser::write_geosite_mrs(&v1).unwrap(),
+        )
+        .unwrap();
+        let asn_target = dir.path().join("asn.mmdb");
+
+        let raw: RawConfig = serde_yaml::from_str(&format!(
+            "geodata:\n  geosite-path: '{}'\n\
+             dns:\n  enable: true\n  nameserver:\n    - rcode://success\n  \
+             nameserver-policy:\n    \"geosite:testcat\": rcode://name_error\n\
+             rules:\n  - MATCH,DIRECT\n",
+            geosite_path.display()
+        ))
+        .unwrap();
+
+        // Bind the "before" generation to v1 through the real parse path.
+        let before_dns = meow_config::parse_dns_from_raw(
+            &raw,
+            Some(dir.path()),
+            &HashMap::new(),
+            Some(&HashMap::new()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let tunnel = Tunnel::new(Arc::clone(&before_dns.resolver));
+        let before = tunnel.resolver();
+
+        tunnel.resolver().lookup_ipv4("hit.example").await;
+        let results = tunnel.resolver().dns_results(Some("hit.example"), 1);
+        assert_eq!(
+            results.first().and_then(|e| e.source.as_deref()),
+            Some("rcode:NoError"),
+            "v1 does not contain the probe domain — the main upstream must answer"
+        );
+
+        let geo = GeoDataConfig {
+            geosite_url: format!("http://{addr}/geosite.mrs"),
+            // Unreachable — tolerated: a partial update still commits.
+            asn_url: "http://127.0.0.1:1/asn.mmdb".to_string(),
+            ..GeoDataConfig::default()
+        };
+        let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
+            Arc::new(RwLock::new(None));
+
+        auto_update_tick(
+            &geo,
+            &tunnel,
+            &RwLock::new(raw),
+            Arc::new(RwLock::new(HashMap::new())),
+            &dashmap::DashMap::new(),
+            &dns_server,
+            dir.path(),
+            &asn_target,
+            &geosite_path,
+        )
+        .await;
+
+        assert!(
+            geosite_path.exists(),
+            "the tick must have written the downloaded DB"
+        );
+        assert!(
+            !Arc::ptr_eq(&before, &tunnel.resolver()),
+            "the periodic tick must republish the resolver generation"
+        );
+        tunnel.resolver().lookup_ipv4("hit.example").await;
+        let results = tunnel.resolver().dns_results(Some("hit.example"), 1);
+        assert_eq!(
+            results.first().and_then(|e| e.source.as_deref()),
+            Some("rcode:NXDomain"),
+            "after the tick the geosite policy must answer via its upstream"
+        );
+        meow_common::clear_host_resolver();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }

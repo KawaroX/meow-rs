@@ -1,4 +1,5 @@
-//! Integration tests for [`meow_app::geodata_fetch::fetch_missing`].
+//! Integration tests for [`meow_app::geodata_fetch::fetch_missing`] and
+//! `run_on_startup`'s download → rebuild → DNS-republish sequence.
 //!
 //! Stands up a hand-rolled HTTP/1.1 server on `127.0.0.1:0` that serves
 //! canned bytes per path, then asserts the helper writes the expected
@@ -28,9 +29,24 @@ async fn spawn_origin(routes: HashMap<&'static str, &'static [u8]>) -> std::net:
             };
             let routes = Arc::clone(&routes);
             tokio::spawn(async move {
-                let mut buf = [0u8; 2048];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]);
+                // Read until the header terminator — a request split into
+                // two TCP segments would otherwise misroute to 404.
+                let mut buf = Vec::with_capacity(2048);
+                let mut chunk = [0u8; 2048];
+                loop {
+                    let n = sock.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    if buf.len() > 64 * 1024 {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf);
                 let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
                 let (status, body): (&str, &[u8]) = match routes.get(path.as_str()) {
                     Some(b) => ("200 OK", b),
@@ -231,4 +247,96 @@ fn geo_target_is_constructible_for_callers() {
         url: "http://example.test/x.mmdb".into(),
     };
     assert_eq!(t.label, "GeoIP MMDB");
+}
+
+/// Issue #543 — the full `run_on_startup` path must republish the
+/// resolver once the geosite DB lands: a `geosite:` nameserver-policy
+/// that could not match before the download must route to its policy
+/// upstream afterwards. `rcode://` upstreams answer a fixed rcode with
+/// no I/O and record their label as the cache entry's `source`, which
+/// makes the tier that answered observable through `dns_results`.
+#[tokio::test]
+async fn run_on_startup_republishes_resolver_with_downloaded_geosite() {
+    use meow_app::geodata_fetch::run_on_startup;
+    use meow_config::geodata::GeoDataConfig;
+    use meow_config::raw::RawConfig;
+    use parking_lot::RwLock;
+
+    let geosite_bytes =
+        meow_rules::mrs_parser::write_geosite_mrs(&meow_rules::mrs_parser::GeositePayload {
+            categories: vec![("testcat".to_string(), vec!["hit.example".to_string()])],
+        })
+        .unwrap();
+    // `spawn_origin` wants 'static byte slices — leak the fixture.
+    let geosite_bytes: &'static [u8] = Box::leak(geosite_bytes.into_boxed_slice());
+    let mut routes = HashMap::new();
+    routes.insert("/geosite.mrs", geosite_bytes);
+    let addr = spawn_origin(routes).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let geosite_path = dir.path().join("geosite.mrs");
+    // mmdb/asn targets pre-exist → `fetch_missing` skips them, and the
+    // config declares no GEOIP/IP-ASN rules so the dummy bytes are never
+    // parsed. geosite.mrs is absent → downloaded from the origin.
+    std::fs::write(dir.path().join("country.mmdb"), b"dummy").unwrap();
+    std::fs::write(dir.path().join("asn.mmdb"), b"dummy").unwrap();
+
+    let raw: RawConfig = serde_yaml::from_str(&format!(
+        "geodata:\n  geosite-path: '{}'\n\
+         dns:\n  enable: true\n  nameserver:\n    - rcode://success\n  \
+         nameserver-policy:\n    \"geosite:testcat\": rcode://name_error\n\
+         rules:\n  - MATCH,DIRECT\n",
+        geosite_path.display()
+    ))
+    .unwrap();
+
+    let resolver = Arc::new(meow_dns::Resolver::new(
+        vec!["127.0.0.1:53".parse().unwrap()],
+        vec![],
+        meow_common::DnsMode::Normal,
+        meow_trie::DomainTrie::new(),
+        true,
+        true,
+    ));
+    let tunnel = meow_tunnel::Tunnel::new(resolver);
+    let before = tunnel.resolver();
+
+    let geo = GeoDataConfig {
+        mmdb_path: Some(dir.path().join("country.mmdb")),
+        asn_path: Some(dir.path().join("asn.mmdb")),
+        geosite_path: Some(geosite_path.clone()),
+        geosite_url: format!("http://{addr}/geosite.mrs"),
+        ..GeoDataConfig::default()
+    };
+
+    run_on_startup(
+        geo,
+        tunnel.clone(),
+        Arc::new(RwLock::new(raw)),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(dashmap::DashMap::new()),
+        Arc::new(RwLock::new(None)),
+        dir.path().to_path_buf(),
+    )
+    .await;
+
+    assert!(
+        geosite_path.exists(),
+        "the missing geosite DB must have been downloaded"
+    );
+    assert!(
+        !Arc::ptr_eq(&before, &tunnel.resolver()),
+        "run_on_startup must republish the resolver generation"
+    );
+    tunnel.resolver().lookup_ipv4("hit.example").await;
+    let results = tunnel.resolver().dns_results(Some("hit.example"), 1);
+    assert_eq!(
+        results.first().and_then(|e| e.source.as_deref()),
+        Some("rcode:NXDomain"),
+        "the republished resolver must bind the downloaded geosite DB"
+    );
+    // `publish_dns` installs the process-global host resolver for an
+    // enabled `dns:` section — clear it so sibling tests observe a
+    // clean global.
+    meow_common::clear_host_resolver();
 }
