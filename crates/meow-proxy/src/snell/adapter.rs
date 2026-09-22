@@ -138,7 +138,11 @@ impl SnellAdapter {
     async fn dial_fresh(&self) -> Result<PoolStream> {
         let tcp = self
             .dialer
-            .dial(&self.server, self.port)
+            // Deliberately `false` (same shape as mux/kcptun sessions): a
+            // pooled conn serves a later stream with no fresh dial, so the
+            // establishing dial is the only signal a lazy front hop ever
+            // sees — marking it internal would hide real reuse traffic.
+            .dial(&self.server, self.port, false)
             .await
             .map_err(MeowError::Io)?;
         let inner: Box<dyn TransportStream> = Box::new(tcp);

@@ -414,6 +414,20 @@ mod tests {
             0,
             "probe dials must not mark the group as used"
         );
+        // The `internal` flag (provider fetches, probes chained through
+        // `dialer-proxy`) is the same housekeeping signal — also skipped
+        // (issue #555).
+        let internal_meta = Metadata {
+            conn_type: meow_common::ConnType::Inner,
+            internal: true,
+            ..Default::default()
+        };
+        let _ = g.dial_tcp(&internal_meta).await;
+        assert_eq!(
+            g.usage_generation(),
+            0,
+            "internal dials must not mark the group as used"
+        );
         let _ = g.dial_tcp(&Metadata::default()).await;
         assert_eq!(g.usage_generation(), 1, "real traffic still marks use");
     }
@@ -500,6 +514,31 @@ mod tests {
         let _ = g.dial_tcp(&Metadata::default()).await;
         assert_eq!(b_ref.dials(), 1, "routing moved past the dead member");
         assert_eq!(a_ref.dials(), 5);
+    }
+
+    #[tokio::test]
+    async fn internal_dial_failures_still_mark_member_dead() {
+        // `touch_user_traffic` skips internal dials, but
+        // `record_dial_failure` deliberately does NOT (#555): a failed
+        // housekeeping dial is real evidence the member is down — the
+        // asymmetry must hold or housekeeping could mask a dead member.
+        let a = MockProxy::new_failing("a", AdapterType::Shadowsocks, "dial timed out");
+        let a_ref = Arc::clone(&a);
+        let g = FallbackGroup::new("fb", vec![a, MockProxy::new("b")]);
+        let internal_meta = Metadata {
+            internal: true,
+            ..Default::default()
+        };
+
+        for _ in 0..5 {
+            let _ = g.dial_tcp(&internal_meta).await;
+        }
+        assert!(
+            !a_ref.alive(),
+            "internal dial failures must still escalate to dead"
+        );
+        // …and the usage gate stays untouched by the same dials.
+        assert_eq!(g.usage_generation(), 0);
     }
 
     #[tokio::test]
