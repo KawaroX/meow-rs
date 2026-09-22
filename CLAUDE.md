@@ -151,7 +151,7 @@ cargo test --lib --bin meow \
   --test config_persistence_test --test systemd_config_test \
   --test trojan_integration --test vless_config_test --test vless_integration \
   --test v2ray_plugin_integration --test gost_plugin_integration \
-  --test shadow_tls_test --test pre_resolve_test \
+  --test shadow_tls_test --test restls_e2e --test pre_resolve_test \
   --test tls_test --test ws_test --test crate_invariants_test \
   --test crate_publish_metadata_test \
   --test smux_singbox_integration
@@ -163,6 +163,15 @@ tunnel → VLESS adapter + smux) against a real sing-box server and **fails**
 version from https://github.com/SagerNet/sing-box/releases or point
 `SINGBOX_BIN` at it. `MEOW_SMUX_E2E_ALLOW_SKIP=1` prints a loud explicit
 skip for local runs only — CI must never set it.
+
+`restls_e2e`'s upstream-interop leg drives the tagged-record wire protocol
+against a real upstream peer (`metacubex/restls-client-go`'s
+`RestlsServer`) and likewise **fails** when `RESTLS_SERVER_BIN` is unset —
+build the harness from
+`crates/meow-transport/tests/support/restls-server` (`go build -o
+restls-server .`); `MEOW_RESTLS_E2E_ALLOW_SKIP=1` prints a loud explicit
+skip for local runs only — CI builds the harness via `actions/setup-go`
+and never sets it.
 
 Keep the target list in sync with `.github/workflows/test.yml`; a new `tests/`
 file that CI runs but this list omits is invisible to the local bar.
