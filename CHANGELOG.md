@@ -546,3 +546,22 @@ the canonical, in-repo source a release is cut from.
   (`new_writer`/`new_reader`); the unbuilt direction is a distinct `Unbuilt`
   variant that hard-errors on misuse rather than passing as the plaintext
   `none` codec. Per-connection cost is halved. (#533)
+
+- **Reloaded `rule-providers` gain or lose their interval refresh task
+  without a restart.** Provider refresh loops were spawned once at
+  startup over the startup-era registry, so a `PUT /configs` or
+  subscription refresh that added, removed, or re-`interval`ed an HTTP
+  rule provider never gained or lost its background task. A new
+  `RefreshSupervisor` (`meow-config::rule_provider_refresh`) diffs the
+  wanted (name → interval) set against running tasks on every commit
+  that swaps the registry — spawning missing, aborting removed or
+  interval-changed, and reaping dead loops — and each loop resolves its
+  provider by name on every tick so it follows registry swaps. Ticks use
+  `MissedTickBehavior::Delay`, so a suspend longer than `interval` no
+  longer fires a back-to-back refresh storm. A successful `refresh()`
+  also writes the provider's payload cache file now, so a `prefer_cache`
+  restart loads the newest refresh rather than the initial-load-era
+  file; an `interval` beyond ~10 years is warn-skipped instead of
+  panicking its task. Embedders: `ApiServer::new` and
+  `subscription_refresh::run_loop` each gained a required
+  `Arc<RefreshSupervisor>` parameter. (issue #543)
