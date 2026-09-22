@@ -153,8 +153,9 @@ is called out explicitly.
 
 Fully supported including AEAD-2022 ciphers. The built-in `v2ray-plugin`
 and `gost-plugin` WebSocket transports are included, along with
-`shadow-tls` (all three protocol versions) and `restls` (both
-`version-hint` modes; `force-tls12` maps to the `tls12` path). External
+`shadow-tls` (all three protocol versions), `restls` (both
+`version-hint` modes; `force-tls12` maps to the `tls12` path) and `jls`
+(hello-random authentication over a real TLS 1.3 handshake). External
 SIP003 plugin binaries are supported via `plugin:` on `ss` nodes and
 `allow-external-plugin` on providers.
 
@@ -371,9 +372,11 @@ preceding hop's stream (mihomo `DialContextWithDialer` semantics).
 `anytls`, and `ss` (built-in obfs/v2ray-plugin/ech-tls-tunnel included) all
 terminate a relay chain. Two carve-outs fail loudly instead of silently
 misbehaving: `hysteria2` (QUIC/UDP cannot ride a TCP stream — first-hop
-only) and `ss` with an external SIP003 plugin (the subprocess owns its
-outbound leg). Mux pooling (`smux`/`yamux`/`h2mux`/`muxcool`) is bypassed on
-relay hops: a relay-supplied stream is single-use and cannot be re-dialled.
+only) and `ss` with `gost-plugin`/`shadow-tls`/`restls`/`jls` or an
+external SIP003 plugin (the plugin owns its outbound leg — a record-level
+transport cannot be replayed over an already-proxied stream). Mux pooling
+(`smux`/`yamux`/`h2mux`/`muxcool`) is bypassed on relay hops: a
+relay-supplied stream is single-use and cannot be re-dialled.
 
 **No health-check on the relay group itself.** Relay is a fixed chain, not
 a pool. For health-aware relay, wrap relay groups inside a Fallback group.

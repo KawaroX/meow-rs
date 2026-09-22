@@ -151,7 +151,7 @@ cargo test --lib --bin meow \
   --test config_persistence_test --test systemd_config_test \
   --test trojan_integration --test vless_config_test --test vless_integration \
   --test v2ray_plugin_integration --test gost_plugin_integration \
-  --test shadow_tls_test --test restls_e2e --test pre_resolve_test \
+  --test shadow_tls_test --test restls_e2e --test jls_e2e --test pre_resolve_test \
   --test tls_test --test ws_test --test crate_invariants_test \
   --test crate_publish_metadata_test \
   --test smux_singbox_integration
@@ -170,6 +170,15 @@ against a real upstream peer (`metacubex/restls-client-go`'s
 build the harness from
 `crates/meow-transport/tests/support/restls-server` (`go build -o
 restls-server .`); `MEOW_RESTLS_E2E_ALLOW_SKIP=1` prints a loud explicit
+skip for local runs only — CI builds the harness via `actions/setup-go`
+and never sets it.
+
+`jls_e2e`'s upstream-interop leg drives the authenticated TLS 1.3
+handshake and data path against a real upstream peer
+(`metacubex/jls-tls`'s `JlsServer`) and likewise **fails** when
+`JLS_SERVER_BIN` is unset — build the harness from
+`crates/meow-transport/tests/support/jls-server` (`go build -o
+jls-server .`); `MEOW_JLS_E2E_ALLOW_SKIP=1` prints a loud explicit
 skip for local runs only — CI builds the harness via `actions/setup-go`
 and never sets it.
 
