@@ -130,9 +130,10 @@ the canonical, in-repo source a release is cut from.
   hard load-time error — plus group members/`use:` names that resolve to
   nothing, entries shadowing built-in adapter names, and malformed
   `dialer-proxy` values. Applies on startup and on `PUT /configs`
-  rebuilds of those sections; `proxy-providers:` definitions are
-  re-validated on every rebuild while their initial *fetch* stays
-  deferred to commit time. It is opt-in because it
+  rebuilds of those sections; `proxy-providers:` definitions whose
+  identity changed are re-validated on rebuild while unchanged defs are
+  reused, and their initial *fetch* stays deferred to commit time. It
+  is opt-in because it
   rejects real-world mihomo subscriptions that mix in node types meow-rs
   does not support; provider *fetch* failures stay lenient (a transient
   download error starts the provider empty rather than failing the
@@ -220,6 +221,13 @@ the canonical, in-repo source a release is cut from.
   channel. A weekly
   `toolchain-drift` workflow runs the lint gate on floating `stable` as an
   early-warning canary for the next pin bump. (#533)
+
+- **The `subscriptions:` config key is documented.** The guide now covers
+  its wholesale-replace of `proxies:`/`proxy-groups:`/`rules:`, the config
+  write-back on every successful refresh, the `-t`-doesn't-fetch boundary,
+  and a providers.md contrast note against `use:` provider pools. The
+  proxy-provider `interval` field is also corrected: no scheduled refresh
+  exists for proxy providers. (#533)
 
 ### Fixed
 

@@ -157,10 +157,7 @@ Upstream rules in `rules/common/` plus `logic/` and `provider/`. Rust rules in `
 
 Upstream supports provider `type: http | file | inline` and `behavior: domain | ipcidr | classical`, with `format: yaml | text | mrs`, plus periodic refresh.
 
-Rust port (`config/rule_provider.rs`) supports: http + file, domain/ipcidr/classical, yaml + text. **Gaps:**
-- `inline` provider type
-- `mrs` binary format
-- `interval` periodic refresh (field accepted but ignored — loaded once at startup; documented in `raw.rs`)
+Rust port (`config/rule_provider.rs`) supports: http + file + inline, domain/ipcidr/classical, yaml + text + mrs, and periodic refresh for http providers (M1.D-5). `interval` is ignored with a warning for `file` providers and rejected for `inline`.
 
 ---
 
@@ -226,7 +223,7 @@ Upstream `hub/route/` mounts these sub-routers, and Clash Dashboard / Yacd expec
 | `POST /cache/fakeip/flush`   | Yes | Yes | OK — clears every fake-IP allocation, 204 on success |
 | `POST /restart`              | Yes | No  | Gap — low priority |
 | `POST /upgrade`              | Yes | No  | Gap — low priority |
-| Auth (Bearer `secret`)       | Yes | No  | **Gap** — `secret` field parsed but never enforced (`#[allow(dead_code)]` in `AppState`) |
+| Auth (Bearer `secret`)       | Yes | Yes | OK — enforced on all REST routes when `secret` is non-empty |
 | CORS                         | Yes | Yes | OK (permissive) |
 | `/ui` static                 | Yes | Yes | OK |
 
@@ -235,7 +232,7 @@ Upstream `hub/route/` mounts these sub-routers, and Clash Dashboard / Yacd expec
 These are unique to this port; document them for API consumers:
 
 - `POST /api/config/save`
-- `GET|POST|DELETE /api/subscriptions[/:name[/refresh]]`
+- `GET|POST /api/subscriptions`, `DELETE /api/subscriptions/:name`, `POST /api/subscriptions/:name/refresh`
 - `GET|POST|PUT|DELETE /api/proxy-groups[/:name[/select]]`
 - `POST /rules` (replace), `PUT /rules` (update by index), `DELETE /rules/:index`, `POST /rules/reorder`
 
@@ -301,7 +298,7 @@ These surfaced during the audit and warrant engineer follow-up even before new f
 2. **API auth bypass**: `AppState.secret` carries `#[allow(dead_code)]` — the REST API is unauthenticated even when `secret` is configured. Security regression vs upstream.
 3. **`RuleMatchHelper.find_process`**: `Box<dyn Fn()>` with no arguments, no return value. Process-name matching silently does nothing. Either wire up real platform lookup (netlink on Linux, `libproc` on macOS) or surface an error for `PROCESS-NAME` rules.
 4. **GEOIP parser gap**: `parse_rule` returns an error for `GEOIP`. Users who put GEOIP rules in YAML will get config-load failures. Shared `Arc<MaxMindDB>` needs to be threaded through the parser, not bolted on separately.
-5. **Rule-providers `interval`**: accepted and ignored. Either drop from schema or implement periodic refresh.
+5. **Rule-providers `interval`**: implemented for HTTP providers since M1.D-5 (background refresh task); ignored with a warning for `file` providers and rejected for `inline`.
 6. **Hosts trie**: allocated in `Resolver::new` but never populated from config.
 7. **In-flight dedup**: allocated but unused (`#[allow(dead_code)]`).
 8. **Logic rules reachability**: `meow-rules/src/logic.rs` exists but `parser.rs` never dispatches `AND/OR/NOT` — verify whether logic rules can be loaded from YAML at all.
