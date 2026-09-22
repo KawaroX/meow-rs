@@ -51,6 +51,7 @@ listeners:
 | `port` | u16 | | — | Unique across listeners; omit or `0` to let the OS assign an ephemeral port |
 | `listen` | string | | per type | Bind IP literal, or `host:port` (e.g. `127.0.0.1:0`) |
 | `tproxy-sni` | bool | | global | (tproxy) deprecated SNI shorthand — prefer [`sniffer`](./sniffer) |
+| `firewall` | bool | | `true` | (tproxy) `false` = external firewall management — no nft/pfctl calls, no cleanup; see [Transparent Proxy](./transparent-proxy) |
 | `max-connections` | usize | | global | Per-listener concurrency cap; `0` = unlimited |
 
 `listen` defaults to `127.0.0.1` for `tproxy` and to the global `bind-address` otherwise.
@@ -120,5 +121,7 @@ rules:
 ## Inspecting listeners
 
 `GET /listeners` returns the active listeners with their name, type, port, and bind
-address. For [ephemeral listeners](#ephemeral-ports) the reported port is the actual
-OS-assigned one, not the configured `0`. See the [REST API reference](../reference/rest-api).
+address; `tproxy` entries additionally report `firewall` (whether meow manages
+the redirect rules or they are externally owned). For [ephemeral listeners](#ephemeral-ports)
+the reported port is the actual OS-assigned one, not the configured `0`. See the
+[REST API reference](../reference/rest-api).

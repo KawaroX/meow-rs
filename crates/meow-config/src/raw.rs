@@ -228,6 +228,10 @@ pub struct RawConfig {
     /// listener. The default is 256; explicit `0` disables the cap. Individual `listeners:`
     /// entries can override this with their own `max-connections` field.
     pub max_connections: Option<usize>,
+    /// No top-level `firewall` key exists — captured only to warn on the
+    /// plausible mistake (`firewall:` belongs on a `listeners:` tproxy
+    /// entry, issue #563).
+    pub firewall: Option<serde_yaml::Value>,
 }
 
 /// A `hosts:` map value: one IP/domain alias or a list of IP addresses.
@@ -323,6 +327,11 @@ pub struct RawListener {
     pub port: Option<u16>,
     pub listen: Option<String>,
     pub tproxy_sni: Option<bool>,
+    /// `tproxy` listeners only: whether meow installs and owns the platform
+    /// firewall rules (default `true`). `false` leaves rule management to
+    /// an external system — no nft/pfctl invocation, no bypass-IP
+    /// collection, no cleanup on exit (issue #563).
+    pub firewall: Option<bool>,
     /// Per-listener override of the global `max-connections` cap. `0`
     /// disables the cap for this listener.
     pub max_connections: Option<usize>,
