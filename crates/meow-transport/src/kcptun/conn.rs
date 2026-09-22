@@ -26,7 +26,9 @@ use tokio::time::Sleep;
 
 use super::crypt::Crypt;
 use super::fec::{FecDecoder, FecEncoder, FEC_HEADER_SIZE_PLUS2, TYPE_DATA, TYPE_PARITY};
+use super::kcp_go as kcp;
 use super::{KcpConfig, MTU_LIMIT};
+use tracing::trace;
 
 /// KCP output sink — `kcp::Kcp` owns the `Write` impl, so queued datagrams
 /// travel through a channel to the poll context that owns the socket.
@@ -42,7 +44,9 @@ impl Write for PacketSink {
         // call here is one wire datagram. try_send is bounded — a full
         // channel drops like upstream's non-blocking `chPostProcessing`
         // (KCP retransmits, so the drop is recoverable, not corruption).
-        let _ = self.tx.try_send(buf.to_vec());
+        if self.tx.try_send(buf.to_vec()).is_err() {
+            trace!("kcp: output sink full — datagram dropped (KCP retransmits)");
+        }
         Ok(buf.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -149,6 +153,9 @@ pub struct KcpStream {
     rate_limit: u64,
     rate_tokens: f64,
     rate_last: Instant,
+    /// `acknodelay` — upstream `ackNoDelay`: every inbound PUSH that
+    /// queues an ACK flushes an ACK-only datagram immediately.
+    ack_nodelay: bool,
     /// Waker of a task parked in `poll_read`. The socket's recv
     /// readiness and `timer` each hold a single waker slot — under
     /// `tokio::io::split` (the smux session's reader/writer tasks) the
@@ -199,13 +206,9 @@ impl KcpStream {
             config.resend,
             config.nc != 0,
         );
-        // Upstream windows are u32; the kcp core caps at u16 — clamp rather
-        // than silently truncating `sndwnd=100000` into a nonsense window.
-        // A zero `snd_wnd` would wedge `poll_write` forever, so bound ≥1.
-        kcp.set_wndsize(
-            config.snd_wnd.clamp(1, u16::MAX as u32) as u16,
-            config.rcv_wnd.clamp(1, u16::MAX as u32) as u16,
-        );
+        // Upstream `WndSize` — u32 windows verbatim; a 0 keeps the
+        // compiled-in default (32/32) rather than wedging the stream.
+        kcp.set_wndsize(config.snd_wnd, config.rcv_wnd);
         // The configured MTU carries crypt + FEC + AEAD-tag overhead —
         // upstream `SetMtu` is `min(mtuLimit, mtu) - headerSize - aead.Overhead()`.
         let overhead = header_size + crypt.aead_overhead();
@@ -236,6 +239,7 @@ impl KcpStream {
             rate_limit: config.rate_limit,
             rate_tokens: config.rate_limit as f64,
             rate_last: Instant::now(),
+            ack_nodelay: config.ack_nodelay,
             read_park: Mutex::new(None),
             write_park: Mutex::new(None),
         })
@@ -271,6 +275,15 @@ impl KcpStream {
         if let Err(e) = self.kcp.update(now_ms()) {
             return Err(io::Error::other(format!("kcp update: {e}")));
         }
+        // A `resendts` due before `ts_flush` must flush now: upstream's
+        // driver fires a FULL flush on every timer pop rather than
+        // gating on the slap. `update` only flushes at interval
+        // boundaries, so arming a 0 ms sleep for `check() == 0` would
+        // hot-spin until `ts_flush` — and delay the retransmit by up to
+        // `interval` besides.
+        if self.kcp.check(now_ms()) == 0 {
+            self.kcp.flush().map_err(io::Error::other)?;
+        }
         if self.kcp.is_dead_link() {
             self.dead = true;
             // A parked peer direction must observe EOF/BrokenPipe now,
@@ -282,21 +295,8 @@ impl KcpStream {
             ));
         }
 
-        // KCP output → FEC → crypt → outbox. The lock only wraps each
-        // `try_recv` — `encode_packet` borrows `&mut self` fields.
-        loop {
-            let pkt = {
-                let rx = self
-                    .tx
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                rx.try_recv()
-            };
-            match pkt {
-                Ok(pkt) => self.encode_packet(&pkt),
-                Err(_) => break,
-            }
-        }
+        // KCP output → FEC → crypt → outbox.
+        self.drain_sink();
 
         // Refill the rate bucket at `rate_limit` bytes/sec.
         if self.rate_limit > 0 {
@@ -322,7 +322,13 @@ impl KcpStream {
                         self.rate_tokens -= pkt.len() as f64;
                     }
                 }
-                Poll::Ready(Err(e)) => return Err(e),
+                Poll::Ready(Err(e)) => {
+                    // Same hand-back as the Ready paths — a departing
+                    // error must not strand a parked peer on wakers we
+                    // may have just replaced.
+                    self.progress();
+                    return Err(e);
+                }
                 Poll::Pending => break,
             }
         }
@@ -354,6 +360,27 @@ impl KcpStream {
         Ok(())
     }
 
+    /// Move queued KCP datagrams through FEC+crypt into the outbox. The
+    /// lock only wraps each `try_recv` — `encode_packet` borrows `&mut
+    /// self` fields. Called from `pump` and after every `input_packet`
+    /// (input-triggered flushes can burst past the 512-deep sink if a
+    /// whole `RX_BUDGET` of ACKs lands before the next drain).
+    fn drain_sink(&mut self) {
+        loop {
+            let pkt = {
+                let rx = self
+                    .tx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                rx.try_recv()
+            };
+            match pkt {
+                Ok(pkt) => self.encode_packet(&pkt),
+                Err(_) => break,
+            }
+        }
+    }
+
     /// Wrap one raw KCP datagram with the FEC seal + crypt envelope and
     /// queue it (plus any parity shards) in the outbox. The outbox is
     /// bounded like a kernel TX queue — a persistently-blocked or
@@ -362,6 +389,7 @@ impl KcpStream {
     fn encode_packet(&mut self, raw: &[u8]) {
         const OUTBOX_CAP: usize = 512;
         if self.outbox.len() >= OUTBOX_CAP {
+            trace!("kcp: outbox full — datagram dropped (KCP retransmits)");
             return;
         }
         let crypt_hdr = self.crypt.header_size();
@@ -369,10 +397,8 @@ impl KcpStream {
         if let Some(enc) = &mut self.fec_enc {
             buf.resize(crypt_hdr + FEC_HEADER_SIZE_PLUS2, 0);
             buf.extend_from_slice(raw);
-            // Upstream passes the session's live `rx_rto` here; the kcp
-            // crate keeps it private, so a fixed 500ms stands in — wire-
-            // compatible either way (parity is always legal), it only
-            // emits parity across quieter gaps than upstream would.
+            // Upstream's `maxFECEncodeLatency` — a fixed 500ms, not the
+            // live RTO.
             let parity = enc.encode(&mut buf, 500);
             self.crypt.seal(&mut buf);
             self.outbox.push_back(buf);
@@ -394,6 +420,10 @@ impl KcpStream {
         if self.crypt.open(&mut pkt).is_err() {
             return; // tampered/garbage datagram — drop, don't kill the stream
         }
+        // Upstream `Input` samples `currentMs()` directly; freshen the
+        // KCP clock before feeding so RTT samples and `resendts` aren't
+        // measured off a stale tick.
+        let _ = self.kcp.update(now_ms());
         if pkt.len() >= 6 {
             let flag = u16::from_le_bytes(pkt[4..6].try_into().unwrap());
             match flag {
@@ -402,25 +432,35 @@ impl KcpStream {
                         return;
                     }
                     // Only data shards feed KCP directly; parity shards are
-                    // recovery input only.
+                    // recovery input only. Both count as `regular` packets
+                    // — upstream marks only parity-REBUILT payloads as FEC.
                     if flag == TYPE_DATA {
-                        let _ = self.kcp.input(&pkt[FEC_HEADER_SIZE_PLUS2..]);
+                        let _ =
+                            self.kcp
+                                .input(&pkt[FEC_HEADER_SIZE_PLUS2..], true, self.ack_nodelay);
                     }
                     for r in self.fec_dec.decode(&pkt) {
                         if r.len() >= 2 {
                             let sz = u16::from_le_bytes(r[..2].try_into().unwrap()) as usize;
                             if sz >= 2 && sz <= r.len() {
-                                let _ = self.kcp.input(&r[2..sz]);
+                                let _ = self.kcp.input(&r[2..sz], false, self.ack_nodelay);
                             }
                         }
                     }
+                    self.drain_sink();
                     return;
                 }
                 _ => {}
             }
         }
         // Raw KCP datagram (no FEC on the peer either) — straight input.
-        let _ = self.kcp.input(&pkt);
+        let _ = self.kcp.input(&pkt, true, self.ack_nodelay);
+
+        // `input` can flush immediately now (UNA slide, fast-retransmit,
+        // ack clocking, `ack_nodelay`) — move those datagrams toward the
+        // outbox each call so a full RX_BUDGET of ACKs can't overflow
+        // the bounded sink before `pump` drains it.
+        self.drain_sink();
     }
 
     /// One bounded pass: socket → `input_packet` → `kcp.recv` → `inbox`.
@@ -441,7 +481,13 @@ impl KcpStream {
                     self.input_packet(pkt);
                     got = true;
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Err(e)) => {
+                    // Datagrams already consumed may have satisfied a
+                    // parked peer's condition — wake it before surfacing
+                    // the error or it waits for the next packet.
+                    self.progress();
+                    return Poll::Ready(Err(e));
+                }
                 Poll::Pending => break,
             }
         }
@@ -507,9 +553,14 @@ impl AsyncRead for KcpStream {
                     buf.put_slice(&b[..bn]);
                 }
                 self.inbox.drain(..n);
+                // Hand wake coverage back — the socket/timer may be
+                // registered to our waker after a wait loop, and a
+                // parked peer direction must not be left uncovered.
+                self.progress();
                 return Poll::Ready(Ok(()));
             }
             if self.dead {
+                self.progress();
                 return Poll::Ready(Ok(())); // EOF
             }
 
@@ -550,6 +601,11 @@ impl AsyncWrite for KcpStream {
                 "kcp: stream closed",
             )));
         }
+        // `AsyncWrite` contract: an empty buffer is a no-op success —
+        // upstream `Send` rejects it outright.
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
         // `UDPSession.WriteBuffers`: block while the unacked queue is at the
         // send window. Inbound ACKs shrink `wait_snd`, so wait on the socket
         // AND the KCP timer while full.
@@ -578,16 +634,20 @@ impl AsyncWrite for KcpStream {
                 }
             }
         }
-        // The kcp crate refuses `>= KCP_WND_RCV` fragments per send
-        // (upstream Go checks the configured window instead) — cap each
-        // send so a large `write_all` chunks instead of erroring.
-        let cap = 127 * self.kcp.mss();
+        // Upstream `Send` hard-caps a single call at 255 fragments (the
+        // u8 `frg` countdown) — chunk larger `write_all`s below it.
+        let cap = 255 * self.kcp.mss();
         let n = self
             .kcp
             .send(&buf[..buf.len().min(cap)])
             .map_err(io::Error::other)?;
+        // `flush` stamps `ts`/`resendts` from `self.current` — freshen
+        // it or long-parked sends get a stale clock (spurious RTO at the
+        // next update + an inflated RTT sample on the peer).
+        let _ = self.kcp.update(now_ms());
         let _ = self.kcp.flush();
         self.pump(cx)?;
+        self.progress();
         Poll::Ready(Ok(n))
     }
 
@@ -600,6 +660,7 @@ impl AsyncWrite for KcpStream {
                 return Poll::Pending;
             }
             passes += 1;
+            let _ = self.kcp.update(now_ms());
             let _ = self.kcp.flush();
             self.pump(cx)?;
             // Flush means "everything handed to the socket", not "acked" —
@@ -607,6 +668,7 @@ impl AsyncWrite for KcpStream {
             // ACKs (upstream `UDPSession.Write` doesn't wait either; KCP
             // retransmit state outlives the flush).
             if self.outbox.is_empty() {
+                self.progress();
                 return Poll::Ready(Ok(()));
             }
             match self.timer.as_mut().poll(cx) {
@@ -628,6 +690,9 @@ impl AsyncWrite for KcpStream {
         match self.as_mut().poll_flush(cx) {
             Poll::Ready(Ok(())) => {
                 self.dead = true;
+                // A parked reader must observe the EOF this `dead` flag
+                // produces — its remaining wake sources may be ours.
+                self.progress();
                 Poll::Ready(Ok(()))
             }
             other => other,
@@ -988,5 +1053,97 @@ mod tests {
             .unwrap();
         assert_eq!(got, msg);
         drain.abort();
+    }
+
+    /// Regression: a `resendts` due before `ts_flush` must flush on the
+    /// timer pop — upstream's driver fires FULL unconditionally, while
+    /// gating on the update-slap spins a 0 ms timer until the interval
+    /// boundary (and stalls the retransmit by up to `interval`). The
+    /// `interval=5000` config makes the gap observable.
+    #[tokio::test]
+    async fn resendts_due_flushes_before_interval_boundary() {
+        let cfg = KcpConfig {
+            crypt: "none".into(),
+            no_comp: true,
+            data_shard: 0,
+            parity_shard: 0,
+            interval: 5000,
+            nodelay: 1,
+            resend: 0,
+            nc: 1,
+            ..Default::default()
+        };
+        let sock_a = udp().await;
+        let b_sock = udp().await;
+        sock_a.connect(b_sock.local_addr().unwrap()).await.unwrap();
+        b_sock.connect(sock_a.local_addr().unwrap()).await.unwrap();
+        let mut a = KcpStream::connect(
+            Box::new(DropFirst {
+                inner: sock_a,
+                left: 1,
+            }),
+            0x11223344,
+            &cfg,
+        )
+        .unwrap();
+        let mut b = KcpStream::connect(Box::new(b_sock), 0x11223344, &cfg).unwrap();
+
+        let echo = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                match b.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if b.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                        let _ = b.flush().await;
+                    }
+                }
+            }
+        });
+
+        let msg = b"lost once, resent fast".as_slice();
+        a.write_all(msg).await.unwrap();
+        a.flush().await.unwrap();
+        let mut back = vec![0u8; msg.len()];
+        tokio::time::timeout(Duration::from_secs(2), a.read_exact(&mut back))
+            .await
+            .expect("retransmit must fire at resendts, not the 5s boundary")
+            .unwrap();
+        assert_eq!(back, msg);
+        echo.abort();
+    }
+
+    /// Regression: `poll_shutdown` flips `dead` — a parked reader must
+    /// observe EOF immediately, not on the next KCP maintenance tick.
+    /// Without the `progress()` hand-off the reader waits out the armed
+    /// timer — `interval=5000` makes the gap observable.
+    #[tokio::test]
+    async fn shutdown_wakes_a_parked_reader() {
+        let cfg = KcpConfig {
+            crypt: "none".into(),
+            no_comp: true,
+            data_shard: 0,
+            parity_shard: 0,
+            interval: 5000,
+            ..Default::default()
+        };
+        let (a, _b) = pair(&cfg).await;
+        let (mut rd, mut wr) = tokio::io::split(a);
+        let reader = tokio::spawn(async move {
+            // `dead` with an empty inbox is EOF — `read` reports 0.
+            rd.read(&mut [0u8; 8]).await
+        });
+        // Let the reader park and arm the far-future timer.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        wr.shutdown().await.unwrap();
+
+        let n = tokio::time::timeout(Duration::from_secs(2), reader)
+            .await
+            .expect("reader must see EOF when shutdown lands `dead`")
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }
