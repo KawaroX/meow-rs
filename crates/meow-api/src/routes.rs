@@ -85,13 +85,6 @@ pub struct AppState {
     /// Validated directory for a third-party web UI. When `Some`, it is served
     /// at `/ui`; when `None`, the built-in panel is served (issue #223).
     pub external_ui: Option<std::path::PathBuf>,
-    /// Serialises `put_configs` and `commit_raw_candidate` so that the
-    /// "read-old-config → write-new-config → TUN reconcile" sequence is
-    /// executed atomically with respect to other config mutations.  Without
-    /// this a concurrent PUT could stop_tun before a sibling's
-    /// set_tun_handle has completed, leaving a running TUN device behind an
-    /// `enable=false` config.
-    pub config_mutation_lock: tokio::sync::Mutex<()>,
     /// Shared on-demand traffic sampler. No timer runs until a client
     /// subscribes to `/traffic`.
     pub traffic_feed: TrafficFeed,
@@ -1040,6 +1033,10 @@ async fn close_all_connections(State(state): State<Arc<AppState>>) -> StatusCode
 async fn save_config(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Hold the lane so the snapshot cannot land mid-commit — between the
+    // raw swap and a possible `tun.enable` rollback — and persist a state
+    // the runtime immediately reverts (issue #543).
+    let _mutation = CONFIG_MUTATION.lock().await;
     let raw = state.raw_config.read().clone();
     meow_config::save_raw_config_async(&state.config_path, &raw)
         .await
@@ -1161,10 +1158,18 @@ async fn apply_raw_to_tunnel(
     Ok((dns, prior_resolver))
 }
 
+/// Rebuild routing + DNS from `candidate`, then commit it as the new raw
+/// config and reconcile the TUN listener. Callers must hold the
+/// `CONFIG_MUTATION` lane — it is the sole serialisation of the
+/// read-old → write-new → reconcile sequence (issue #543).
 async fn commit_raw_candidate(
     state: &AppState,
     candidate: RawConfig,
 ) -> Result<(), (StatusCode, String)> {
+    debug_assert!(
+        CONFIG_MUTATION.try_lock().is_err(),
+        "caller must hold the CONFIG_MUTATION lane"
+    );
     let (dns, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
     swap_config_and_reconcile_tun(state, candidate, dns, prior_resolver).await;
     Ok(())
@@ -1182,11 +1187,19 @@ async fn commit_raw_candidate(
 /// declared names, or re-declared names whose definition changed — get a
 /// detached initial fetch so `use:` groups populate without a manual
 /// refresh; acquisition failure is a runtime condition, not a config defect.
+///
+/// Callers must hold the `CONFIG_MUTATION` lane (issue #543) — the
+/// insert/prune ordering below is only meaningful when no sibling commit
+/// can interleave a registry swap.
 pub fn commit_proxy_providers(
     registry: &DashMap<String, Arc<ProxyProvider>>,
     candidate: &std::collections::HashMap<String, Arc<ProxyProvider>>,
     strict: bool,
 ) {
+    debug_assert!(
+        CONFIG_MUTATION.try_lock().is_err(),
+        "caller must hold the CONFIG_MUTATION lane"
+    );
     for (name, provider) in candidate {
         provider.set_strict(strict);
         // Reused providers may carry dead derived slots from failed
@@ -1293,6 +1306,10 @@ fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
 /// into — the candidate build's own cell. Provider fetch contexts built
 /// here retain it so chained download adapters keep resolving after later
 /// rebuilds (issue #533).
+///
+/// Callers must hold the `CONFIG_MUTATION` lane — the old-vs-candidate
+/// comparison is only meaningful while no sibling commit can interleave
+/// (issue #543).
 #[allow(
     clippy::too_many_arguments,
     reason = "each argument is a distinct piece of one commit's rebuild context"
@@ -1307,6 +1324,10 @@ pub async fn reconcile_dns_config(
     prior_resolver: Option<Arc<meow_dns::Resolver>>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<Option<meow_config::DnsConfig>, (StatusCode, String)> {
+    debug_assert!(
+        CONFIG_MUTATION.try_lock().is_err(),
+        "caller must hold the CONFIG_MUTATION lane"
+    );
     let unchanged = {
         let old = raw_config.read();
         // `#name`/`rule-set:` references capture objects whose identity is
@@ -1355,11 +1376,18 @@ pub async fn reconcile_dns_config(
 /// handles listener rebinds). Writing the slot of a soon-to-be-rebound
 /// server is harmless — it either keeps serving on the new generation or
 /// is torn down moments later.
+///
+/// Callers must hold the `CONFIG_MUTATION` lane (issue #543) — the slot
+/// swap must be ordered against the commit that produced `dns`.
 pub fn install_resolver_everywhere(
     tunnel: &Tunnel,
     dns_server: &RwLock<Option<DnsServerHandle>>,
     dns: &meow_config::DnsConfig,
 ) {
+    debug_assert!(
+        CONFIG_MUTATION.try_lock().is_err(),
+        "caller must hold the CONFIG_MUTATION lane"
+    );
     tunnel.set_resolver(Arc::clone(&dns.resolver));
 
     // Same host-resolver policy as `main.rs` startup: installed whenever
@@ -1386,13 +1414,18 @@ pub fn install_resolver_everywhere(
 /// slot (routing lookups + built-in DIRECT), refresh the standalone DNS
 /// server (in-place resolver swap when the listen addr is unchanged,
 /// rebind otherwise), and re-install the process-wide host-resolver hook
-/// under the same policy startup uses (issue #514).
+/// under the same policy startup uses (issue #514). Callers must hold
+/// the `CONFIG_MUTATION` lane (issue #543).
 pub async fn publish_dns(
     tunnel: &Tunnel,
     dns_server: &RwLock<Option<DnsServerHandle>>,
-    dns: meow_config::DnsConfig,
+    dns: &meow_config::DnsConfig,
 ) {
-    install_resolver_everywhere(tunnel, dns_server, &dns);
+    debug_assert!(
+        CONFIG_MUTATION.try_lock().is_err(),
+        "caller must hold the CONFIG_MUTATION lane"
+    );
+    install_resolver_everywhere(tunnel, dns_server, dns);
 
     // Standalone `dns.listen` server keep-decision: `keep` also requires a
     // live serve task — the slot was already swapped above, so an
@@ -2217,11 +2250,11 @@ async fn spawn_tun_from_raw(
 }
 
 /// Commit `candidate` as the new raw config and reconcile the TUN listener
-/// against the `tun.enable` transition. The whole sequence is serialised by
-/// `config_mutation_lock` so two concurrent mutations cannot interleave
-/// their TUN start/stop operations — without this a disable→stop could run
-/// before a sibling enable→start has stored its handle, leaving a running
-/// device behind an `enable=false` config.
+/// against the `tun.enable` transition. The whole sequence runs inside the
+/// `CONFIG_MUTATION` lane every caller already holds, so two concurrent
+/// mutations cannot interleave their TUN start/stop operations — without
+/// that a disable→stop could run before a sibling enable→start has stored
+/// its handle, leaving a running device behind an `enable=false` config.
 ///
 /// On an off→on transition, if the TUN listener fails to start the stored
 /// config is rolled back (`tun.enable` set to `false`) to prevent state
@@ -2242,8 +2275,10 @@ async fn swap_config_and_reconcile_tun(
     dns: Option<meow_config::DnsConfig>,
     prior_resolver: Arc<meow_dns::Resolver>,
 ) {
-    let _guard = state.config_mutation_lock.lock().await;
-
+    debug_assert!(
+        CONFIG_MUTATION.try_lock().is_err(),
+        "caller must hold the CONFIG_MUTATION lane"
+    );
     let new_enable = candidate.tun.as_ref().is_some_and(|t| t.enable);
     // Snapshot the candidate (only on an off→on transition, before it is
     // moved into the lock) so the parking_lot write guard — which is
@@ -2281,7 +2316,7 @@ async fn swap_config_and_reconcile_tun(
         )
     });
     if let Some(dns) = dns {
-        publish_dns(&state.tunnel, &state.dns_server, dns).await;
+        publish_dns(&state.tunnel, &state.dns_server, &dns).await;
     }
     // The TUN listener snapshots `fake_ip_v4_net`/`fake_ip_v4_gateway`/
     // DnsGuard when the stack is built; after a resolver swap those are
@@ -3429,6 +3464,9 @@ mod tests {
         let keep = mk("keep");
         registry.insert("keep".to_string(), Arc::clone(&keep));
         registry.insert("gone".to_string(), mk("gone"));
+
+        // `commit_proxy_providers` asserts the caller holds the lane.
+        let _lane = CONFIG_MUTATION.lock().await;
 
         let candidate: HashMap<String, Arc<ProxyProvider>> = HashMap::from([
             ("keep".to_string(), Arc::clone(&keep)), // reused Arc

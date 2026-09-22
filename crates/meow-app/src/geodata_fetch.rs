@@ -135,7 +135,7 @@ async fn republish_dns_for_geo_dbs(
     })
     .await;
     match parsed {
-        Ok(Ok(dns)) => meow_api::routes::publish_dns(tunnel, dns_server, dns).await,
+        Ok(Ok(dns)) => meow_api::routes::publish_dns(tunnel, dns_server, &dns).await,
         Ok(Err(e)) => warn!("{label}: dns republish skipped: {e:#}"),
         Err(e) => warn!("{label}: dns republish task failed: {e}"),
     }
@@ -545,6 +545,9 @@ mod tests {
         let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
             Arc::new(RwLock::new(None));
 
+        // Production callers hold the lane; the debug_assert in
+        // `publish_dns` enforces that contract here too.
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
 
         assert!(
@@ -604,6 +607,9 @@ mod tests {
                 resolver_slot: Arc::clone(&slot),
             })));
 
+        // Production callers hold the lane; the debug_assert in
+        // `publish_dns` enforces that contract here too.
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
 
         assert!(
@@ -692,6 +698,9 @@ mod tests {
         .unwrap();
         let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
             Arc::new(RwLock::new(None));
+        // Production callers hold the lane; the debug_assert in
+        // `publish_dns` enforces that contract here too.
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
 
         assert!(!Arc::ptr_eq(&before, &tunnel.resolver()));
@@ -739,6 +748,9 @@ mod tests {
         let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
             Arc::new(RwLock::new(None));
 
+        // Production callers hold the lane; the debug_assert in
+        // `publish_dns` enforces that contract here too.
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
 
         assert!(
@@ -789,6 +801,9 @@ mod tests {
         .unwrap();
         let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
             Arc::new(RwLock::new(None));
+        // Production callers hold the lane; the debug_assert in
+        // `publish_dns` enforces that contract here too.
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
 
         let after = tunnel.resolver();
@@ -857,6 +872,9 @@ mod tests {
         .unwrap();
         let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
             Arc::new(RwLock::new(None));
+        // Production callers hold the lane; the debug_assert in
+        // `publish_dns` enforces that contract here too.
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
         drop(rebuild);
 
