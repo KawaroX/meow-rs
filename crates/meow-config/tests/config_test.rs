@@ -68,8 +68,14 @@ proxy-groups:
     assert_eq!(fallback.current().as_deref(), Some("node-a"));
 }
 
+/// Issue #561: a group may not reuse the name of an existing registry
+/// entry. Before the duplicate-name check, this config built: `parent`
+/// captured the leaf `child`, then the group `child` replaced the
+/// registry entry — parent and registry disagreed about the name.
+/// Mirroring mihomo (`proxy group %s: the duplicate name`), the load now
+/// fails instead.
 #[tokio::test]
-async fn test_forward_group_reference_uses_group_when_leaf_has_same_name() {
+async fn test_group_name_colliding_with_leaf_proxy_is_rejected() {
     let yaml = r#"
 proxies:
   - name: child
@@ -92,20 +98,183 @@ proxy-groups:
       - node-a
 "#;
 
-    let config = load_config_from_str(yaml).await.unwrap();
-    let parent = config.proxies.get("parent").expect("parent must be built");
-    let child = config
-        .proxies
-        .get("child")
-        .expect("child group must replace the same-named leaf");
-    let parent_member = parent
-        .unwrap_proxy(&meow_common::Metadata::default(), true)
-        .expect("parent must select its child member");
-
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("a group named after a leaf proxy must be rejected");
     assert!(
-        std::sync::Arc::ptr_eq(&parent_member, child),
-        "parent must retain the child group, not the superseded same-named leaf"
+        err.to_string().contains("duplicate name"),
+        "unexpected error: {err}"
     );
+}
+
+/// Issue #561's minimal config: two `child` declarations, the later one
+/// unresolvable. Previously `parent` captured the first `child` while the
+/// lenient second pass replaced the registry entry with the last-built
+/// one — two different objects under one name.
+#[tokio::test]
+async fn test_duplicate_group_names_are_rejected() {
+    let yaml = r#"
+proxies:
+  - name: node-a
+    type: socks5
+    server: 127.0.0.1
+    port: 10001
+  - name: node-b
+    type: socks5
+    server: 127.0.0.1
+    port: 10002
+
+proxy-groups:
+  - name: parent
+    type: select
+    proxies:
+      - child
+  - name: child
+    type: select
+    proxies:
+      - node-a
+  - name: child
+    type: select
+    proxies:
+      - missing-group
+      - node-b
+"#;
+
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("duplicate group names must be rejected");
+    assert!(
+        err.to_string().contains("duplicate name"),
+        "unexpected error: {err}"
+    );
+}
+
+/// The duplicate check is declaration-level: a later same-named block
+/// that could never build (unknown type) is still a duplicate, not a
+/// benign extra declaration.
+#[tokio::test]
+async fn test_duplicate_group_name_rejected_even_when_last_block_is_invalid() {
+    let yaml = r#"
+proxy-groups:
+  - name: child
+    type: select
+    proxies: [DIRECT]
+  - name: child
+    type: not-a-real-type
+"#;
+
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("a duplicate that cannot build must still be rejected");
+    assert!(
+        err.to_string().contains("duplicate name"),
+        "unexpected error: {err}"
+    );
+}
+
+/// The mirror ordering fails too: an unbuildable *first* declaration does
+/// not hide the duplicate — the check scans declarations, not
+/// successfully-built groups.
+#[tokio::test]
+async fn test_duplicate_group_name_rejected_even_when_first_block_is_invalid() {
+    let yaml = r#"
+proxy-groups:
+  - name: child
+    type: not-a-real-type
+  - name: child
+    type: select
+    proxies: [DIRECT]
+"#;
+
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("a duplicate whose first block cannot build is still a duplicate");
+    assert!(
+        err.to_string().contains("duplicate name"),
+        "unexpected error: {err}"
+    );
+}
+
+/// `proxies:` leaf duplicates keep the documented last-wins behavior —
+/// every leaf settles before any group captures members, so a same-named
+/// leaf cannot split the registry the way group duplicates did. This is a
+/// deliberate divergence from upstream, which hard-errors on leaf
+/// duplicates (`proxy %s is the duplicate name`).
+#[tokio::test]
+async fn test_duplicate_leaf_proxy_names_still_last_wins() {
+    let yaml = r#"
+proxies:
+  - name: node
+    type: socks5
+    server: 127.0.0.1
+    port: 10001
+  - name: node
+    type: direct
+proxy-groups:
+  - name: g
+    type: select
+    proxies: [node]
+rules:
+  - MATCH,g
+"#;
+
+    let config = load_config_from_str(yaml)
+        .await
+        .expect("duplicate proxies: entries stay last-wins");
+    assert_eq!(
+        config.proxies["node"].adapter_type(),
+        meow_common::AdapterType::Direct,
+        "the last-declared block wins the registry slot"
+    );
+}
+
+/// A group may not shadow a built-in either — every built-in is a
+/// registry entry, so a same-named group would split parents that
+/// captured the built-in from rules resolving the name.
+#[tokio::test]
+async fn test_group_name_colliding_with_builtin_is_rejected() {
+    for name in [
+        "DIRECT",
+        "REJECT",
+        "REJECT-DROP",
+        "COMPATIBLE",
+        "PASS",
+        "PASS-RULE",
+    ] {
+        let yaml = format!(
+            r#"
+proxy-groups:
+  - name: {name}
+    type: select
+    proxies: [REJECT]
+"#
+        );
+
+        let err = load_config_from_str(&yaml)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("a group named {name} must be rejected"));
+        assert!(
+            err.to_string().contains("duplicate name"),
+            "{name}: unexpected error: {err}"
+        );
+    }
+
+    // Registry keys are case-sensitive (byte-exact, like upstream's
+    // map[string]): a lowercase `direct` group is a distinct name.
+    let yaml = r#"
+proxy-groups:
+  - name: direct
+    type: select
+    proxies: [DIRECT]
+"#;
+    load_config_from_str(yaml)
+        .await
+        .expect("names are matched byte-exactly — 'direct' is not 'DIRECT'");
 }
 
 #[tokio::test]
