@@ -109,7 +109,12 @@ pub(super) mod flow {
         };
 
         let inner = tunnel.inner();
-        inner.pre_handle_metadata(&mut metadata);
+        if matches!(
+            inner.pre_handle_metadata(&mut metadata),
+            meow_tunnel::PreHandleVerdict::Drop
+        ) {
+            return Err("unmapped fake-ip destination".into());
+        }
         // UDP keeps the eager pre_resolve (no lazy enrichment): the outbound
         // packet API needs a resolved dst_ip regardless of what the rules
         // demand — including after a fake-IP was rewritten back to a hostname.
@@ -241,6 +246,7 @@ pub(super) mod flow {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::flow::{self, ReplyMsg, DATAGRAM_BUF, FLOW_QUEUE};
+    use meow_common::{Metadata, Network};
     use meow_tunnel::Tunnel;
     use std::collections::HashMap;
     use std::io;
@@ -386,6 +392,24 @@ mod linux {
             data: Vec<u8>,
             key: (SocketAddr, SocketAddr),
         ) -> bool {
+            // A destination inside the fake-IP range with no live
+            // allocation would spawn a flow that immediately drops —
+            // drop the datagram here instead of churning a spawn+evict
+            // per packet under a stale flood (issue #618). The flow task
+            // re-checks the verdict; the call is idempotent.
+            let mut probe = Metadata {
+                network: Network::Udp,
+                dst_ip: Some(key.1.ip()),
+                dst_port: key.1.port(),
+                ..Default::default()
+            };
+            if matches!(
+                tunnel.inner().pre_handle_metadata(&mut probe),
+                meow_tunnel::PreHandleVerdict::Drop
+            ) {
+                debug!("tproxy udp: drop datagram to unmapped fake-ip {}", key.1);
+                return false;
+            }
             // `max_flows == 0` means explicitly unlimited (SS
             // `max-connections` precedent); a pending dial occupies its
             // budget too, so concurrent first packets of a new tuple always
