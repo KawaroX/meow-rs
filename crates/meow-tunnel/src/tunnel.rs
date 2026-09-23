@@ -141,6 +141,9 @@ pub struct TunHandle {
     /// Flips `true` once this generation's lwIP core finished teardown.
     /// `None` for non-lwIP/test handles that have no core to await.
     pub core_done: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Live TUN UDP flow-table occupancy (issue #515). A stub zeroed
+    /// gauge for non-lwIP/test handles.
+    pub udp_flows: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Upper bound on waiting for a torn-down lwIP core. Teardown is a
@@ -242,7 +245,11 @@ impl TunnelInner {
     /// through the route table's registry cell — a reload that swaps the
     /// table between resolve and dial would otherwise strand the chain on a
     /// dead generation (issue #533 review).
-    pub fn resolve_proxy(&self, metadata: &Metadata) -> Option<ResolvedTarget> {
+    ///
+    /// `async` because the PROCESS-* enrichment runs the platform socket scan
+    /// on the blocking pool — keeping it synchronous here would stall the
+    /// calling worker on hosts with large socket tables (issue #515).
+    pub async fn resolve_proxy(&self, metadata: &Metadata) -> Option<ResolvedTarget> {
         let mode = *self.mode.read();
         match mode {
             TunnelMode::Direct => Some(ResolvedTarget {
@@ -277,7 +284,7 @@ impl TunnelInner {
                 let route = self.route();
                 let needs_proc = route.compiled_rules.needs_process_lookup();
                 let enriched = if needs_proc {
-                    match_engine::maybe_enrich_with_process(metadata)
+                    match_engine::maybe_enrich_with_process_async(metadata).await
                 } else {
                     None
                 };
@@ -305,7 +312,7 @@ impl TunnelInner {
     pub async fn resolve_proxy_lazy(&self, metadata: &mut Metadata) -> Option<ResolvedTarget> {
         let mode = *self.mode.read();
         if mode != TunnelMode::Rule {
-            return self.resolve_proxy(metadata);
+            return self.resolve_proxy(metadata).await;
         }
 
         // Owned `Arc` snapshot: the enrichment arm holds it across an
@@ -326,7 +333,7 @@ impl TunnelInner {
                 // copy is used for matching only, so tracked connection
                 // metadata stays byte-identical to the eager path.
                 let mut enriched = if needs_process {
-                    match_engine::maybe_enrich_with_process(metadata)
+                    match_engine::maybe_enrich_with_process_async(metadata).await
                 } else {
                     None
                 };
@@ -848,7 +855,10 @@ impl Tunnel {
     pub async fn set_tun_handle(&self, handle: TunHandle) {
         let prev = self.inner.tun_handle.write().replace(handle);
         // parking_lot RwLock write guard is dropped here — safe to .await
-        if let Some(TunHandle { task, core_done }) = prev {
+        if let Some(TunHandle {
+            task, core_done, ..
+        }) = prev
+        {
             task.abort();
             // Await the parent: dropping its future drops the TaskGroup,
             // which requests abort of the child tasks holding the device.
@@ -871,7 +881,10 @@ impl Tunnel {
     pub async fn stop_tun(&self) {
         let handle = self.inner.tun_handle.write().take();
         // parking_lot RwLock write guard is dropped here — safe to .await
-        if let Some(TunHandle { task, core_done }) = handle {
+        if let Some(TunHandle {
+            task, core_done, ..
+        }) = handle
+        {
             task.abort();
             let _ = task.await;
             if let Some(done) = core_done {
@@ -891,6 +904,19 @@ impl Tunnel {
             .read()
             .as_ref()
             .is_some_and(|h| !h.task.is_finished())
+    }
+
+    /// Live TUN UDP flow-table occupancy (issue #515). Zero when no TUN
+    /// listener is running — a stored handle whose task already exited
+    /// reports zero rather than the gauge's frozen final value.
+    pub fn tun_udp_flow_count(&self) -> usize {
+        self.inner.tun_handle.read().as_ref().map_or(0, |h| {
+            if h.task.is_finished() {
+                0
+            } else {
+                h.udp_flows.load(std::sync::atomic::Ordering::Relaxed)
+            }
+        })
     }
 }
 
@@ -1074,7 +1100,40 @@ mod tests {
         TunHandle {
             task,
             core_done: None,
+            udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Issue #515: `tun_udp_flow_count` reads the live gauge only while the
+    /// listener task runs — a stored-but-finished handle reports zero, not
+    /// the gauge's frozen final value.
+    #[tokio::test]
+    async fn tun_udp_flow_count_tracks_live_gauge() {
+        let tunnel = test_tunnel();
+        assert_eq!(tunnel.tun_udp_flow_count(), 0, "no handle → zero");
+
+        let gauge = Arc::new(std::sync::atomic::AtomicUsize::new(7));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut handle = task_handle(tokio::spawn(async move {
+            let _ = done_rx.await;
+        }));
+        handle.udp_flows = Arc::clone(&gauge);
+        tunnel.set_tun_handle(handle).await;
+        assert_eq!(tunnel.tun_udp_flow_count(), 7);
+
+        gauge.store(3, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(tunnel.tun_udp_flow_count(), 3, "gauge is read live");
+
+        // The task exits while the handle stays stored — the count must
+        // read zero rather than the gauge's frozen final value.
+        let _ = done_tx.send(());
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            tunnel.tun_udp_flow_count(),
+            0,
+            "a finished listener reports zero even though the gauge lingers"
+        );
     }
 
     #[tokio::test]
@@ -1140,6 +1199,7 @@ mod tests {
             .set_tun_handle(TunHandle {
                 task,
                 core_done: Some(done_rx),
+                udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })
             .await;
 
@@ -1276,8 +1336,8 @@ mod tests {
     /// Issue #533: the built-in proxies map registers PASS / PASS-RULE /
     /// COMPATIBLE, and a rule targeting PASS skips silently to the next
     /// rule — upstream `continue GetRules` in `match()`.
-    #[test]
-    fn pass_builtin_skips_matched_rule() {
+    #[tokio::test]
+    async fn pass_builtin_skips_matched_rule() {
         use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
 
         let tunnel = test_tunnel();
@@ -1309,7 +1369,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
+        let adapter = tunnel.inner().resolve_proxy(&meta).await.unwrap().adapter;
         assert_eq!(
             adapter.name(),
             "REJECT",
@@ -1320,8 +1380,8 @@ mod tests {
     /// A rule targeting a group whose selected member is PASS also skips —
     /// the match loop walks `unwrap_proxy(metadata, false)` for the type
     /// tag without committing selection side effects.
-    #[test]
-    fn pass_inside_group_unwrap_skips_rule() {
+    #[tokio::test]
+    async fn pass_inside_group_unwrap_skips_rule() {
         use meow_proxy::SelectorGroup;
         use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
 
@@ -1349,7 +1409,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
+        let adapter = tunnel.inner().resolve_proxy(&meta).await.unwrap().adapter;
         assert_eq!(
             adapter.name(),
             "DIRECT",
@@ -1360,8 +1420,8 @@ mod tests {
     /// PASS-RULE targeted at the top level behaves like REJECT — the match
     /// returns it and dialing yields immediate EOF, same as upstream's
     /// nop adapter.
-    #[test]
-    fn pass_rule_at_top_level_rejects() {
+    #[tokio::test]
+    async fn pass_rule_at_top_level_rejects() {
         use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
 
         let tunnel = test_tunnel();
@@ -1381,7 +1441,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
+        let adapter = tunnel.inner().resolve_proxy(&meta).await.unwrap().adapter;
         assert_eq!(
             adapter.adapter_type(),
             AdapterType::PassRule,
@@ -1391,8 +1451,8 @@ mod tests {
 
     /// COMPATIBLE resolves like any real target and buckets its stats as
     /// `"DIRECT"` — it is a direct dialer, not a signal adapter.
-    #[test]
-    fn compatible_resolves_and_buckets_direct() {
+    #[tokio::test]
+    async fn compatible_resolves_and_buckets_direct() {
         use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
 
         let tunnel = test_tunnel();
@@ -1412,7 +1472,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
+        let adapter = tunnel.inner().resolve_proxy(&meta).await.unwrap().adapter;
         assert_eq!(
             adapter.adapter_type(),
             AdapterType::Compatible,
@@ -1548,7 +1608,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
+        let adapter = tunnel.inner().resolve_proxy(&meta).await.unwrap().adapter;
         assert_eq!(adapter.name(), "g");
         // The group selects n1, whose socks5 adapter dials 127.0.0.1:1
         // through the injected `front` hop; the front records the dial and
@@ -1564,5 +1624,59 @@ mod tests {
         };
         assert_eq!(dial.dst_ip, Some("127.0.0.1".parse().unwrap()));
         assert_eq!(dial.dst_port, 1);
+    }
+
+    /// Issue #515: the PROCESS-* enrichment call inside `resolve_proxy`
+    /// itself — not just the helper — must run when the compiled rule set
+    /// demands it. A regression that dropped the `.await` enrichment would
+    /// leave every test here green while PROCESS rules silently stop
+    /// matching in production.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn resolve_proxy_invokes_process_enrichment() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = listener.local_addr().unwrap();
+        let proc_name = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        assert!(!proc_name.is_empty(), "expected a test binary name");
+
+        let tunnel = test_tunnel();
+        let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+        let mut proxies = res.proxies;
+        let direct = Arc::clone(proxies.get("DIRECT").unwrap());
+        proxies.insert("proc-target".into(), direct);
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(meow_rules::process::ProcessRule::new(
+                    &proc_name,
+                    "proc-target",
+                )) as Box<dyn Rule>,
+                Box::new(meow_rules::final_rule::FinalRule::new("DIRECT")),
+            ],
+            res.dialer_registry,
+        );
+
+        let metadata = Metadata {
+            network: Network::Tcp,
+            src_ip: Some(local.ip()),
+            src_port: local.port(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let resolved = tunnel
+            .inner()
+            .resolve_proxy(&metadata)
+            .await
+            .expect("rule table must resolve");
+        // The adapter re-registered under "proc-target" is the DIRECT
+        // instance, so `adapter.name()` stays "DIRECT" — pin the matched
+        // rule instead, which is what proves the enrichment ran.
+        assert_eq!(
+            resolved.rule_name, "PROCESS-NAME",
+            "PROCESS-NAME rule must match the enrichment done inside resolve_proxy"
+        );
     }
 }

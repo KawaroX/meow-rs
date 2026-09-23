@@ -87,6 +87,11 @@ Consequences:
   `auto-route` has nothing safe to route and warns; you can still add routes
   to the device manually, but you are then responsible for loop avoidance.
 - UDP flows (including QUIC) to fake IPs are captured and routed per-rule.
+  The flow table is bounded at 1024 live entries — at capacity the
+  least-recently-active flow is evicted — and `dns-hijack` runs at most 64
+  concurrent in-process answers (queries it cannot decide locally past
+  that bound are dropped; clients retry). Live occupancy is observable via
+  `Tunnel::tun_udp_flow_count`.
 - ICMP echo requests entering the device are answered by the userspace
   stack itself — `ping` to a fake IP confirms the tun is up, but is not an
   end-to-end probe of the remote host.
@@ -160,7 +165,7 @@ ip route | grep -c '/1 dev' # → 0
 | `outbound-interface` | auto-detect | Physical interface outbound sockets bind to in `global` mode. Ignored otherwise. |
 | `dns-hijack` | off | List of targets; any `:53` entry turns on in-process answering of UDP :53 flows entering the device. Non-`:53` entries warn and are ignored. |
 | `udp-timeout` | `60` | Seconds of idle before a UDP flow is evicted. |
-| `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); a change while TUN runs restarts the listener. |
+| `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); bounds **TCP** flows — a change while TUN runs restarts the listener. The UDP flow table has its own fixed bound (1024 live flows, least-recently-active eviction) that `max-connections` does not adjust. |
 
 mihomo fields meow does not implement (`stack`, `strict-route`,
 `auto-detect-interface`, `inet6-address`, `endpoint-independent-nat`,

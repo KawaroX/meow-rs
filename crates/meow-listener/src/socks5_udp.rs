@@ -8,26 +8,28 @@
 //! reply task is dropped).
 //!
 //! Routing mirrors `meow_tunnel::udp::handle_udp`: fake-IP rewrite → pre-resolve
-//! → rule match → `dial_udp`. A small per-association
-//! NAT (`dst -> session`) dedups outbound conns; each session has a reply task
-//! that reads server→client datagrams and writes them back wrapped in the
-//! SOCKS5 UDP header.
+//! → rule match → `dial_udp`. A bounded per-association
+//! NAT (`SessionKey -> session`, keying on address or hostname) dedups outbound
+//! conns; each session task performs its own dial then writes queued datagrams
+//! in order while a nested reply task pumps server→client traffic back.
 
 use meow_common::atomic::AtomicU;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meow_common::{with_dial_timeout, ConnType, Metadata, Network, ProxyPacketConn};
-use meow_tunnel::{ResolvedTarget, Tunnel};
+use meow_common::{with_dial_timeout, ConnType, Metadata, Network};
+use meow_tunnel::{ResolvedTarget, Tunnel, TunnelInner};
 use smallvec::SmallVec;
+use smol_str::SmolStr;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
-use tracing::debug;
+use tokio::sync::mpsc;
+use tracing::{debug, info};
 
 use crate::monotonic_ms;
 
@@ -38,22 +40,47 @@ const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
 const NAT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// Per-session client→upstream queue. Datagrams arriving while a session is
+/// still establishing (resolve + route + `dial_udp`) queue here; overflow is
+/// dropped (UDP semantics — the client retries).
+const SESSION_QUEUE: usize = 64;
+/// Bound on concurrent outbound sessions per association. A unique-tuple
+/// flood must not grow the NAT map without bound; at the cap the
+/// least-recently-active session is evicted (same LRU-idle policy the
+/// sweeper applies on a timer).
+const MAX_SESSIONS: usize = 1024;
 
-/// Per-destination outbound session within one association.
+/// NAT key for a per-destination session. Literal-IP destinations key by
+/// socket address (zero allocation on the per-datagram path); domain-form
+/// destinations key by the already-lowercased `SmolStr` host plus port —
+/// cloning it is an inline copy or refcount bump, not a `format!` alloc.
+/// Resolution happens inside the session task, so a slow lookup can no
+/// longer stall the read loop.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SessionKey {
+    Addr(SocketAddr),
+    Host(SmolStr, u16),
+}
+
+/// Per-destination outbound session within one association. The read loop
+/// never awaits a dial or an upstream write: payloads are queued onto `tx`
+/// and the session task performs resolution, routing, `dial_udp`, and the
+/// ordered write loop off-loop (issue #515 — a slow destination must not
+/// head-of-line block the whole association).
 struct Session {
-    conn: Arc<dyn ProxyPacketConn>,
+    tx: mpsc::Sender<SmallVec<[u8; 1500]>>,
     last_activity_ms: Arc<AtomicU>,
-    /// Set by the reply task when it exits: the session can no longer
-    /// deliver server→client traffic, so it is one-way and must be re-dialed
-    /// rather than kept (issue #514).
-    dead: Arc<std::sync::atomic::AtomicBool>,
-    /// Reply task (server→client); aborted when the session is dropped.
-    reply_task: tokio::task::AbortHandle,
+    /// Set when the session task exits for any reason: the session can no
+    /// longer deliver traffic either way, so it must be re-dialed rather
+    /// than kept (issue #514).
+    dead: Arc<AtomicBool>,
+    /// Session task (establish → writer loop; owns the reply reader).
+    task: tokio::task::AbortHandle,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        self.reply_task.abort();
+        self.task.abort();
     }
 }
 
@@ -80,7 +107,8 @@ pub async fn handle_udp_associate(
     write_associate_reply(&mut control, bnd).await?;
     debug!("SOCKS5 UDP ASSOCIATE from {src_addr}: relay bound on {bnd}");
 
-    let mut nat: HashMap<SocketAddr, Session> = HashMap::new();
+    let inner = Arc::clone(tunnel.inner());
+    let mut nat: HashMap<SessionKey, Session> = HashMap::new();
     let mut buf = vec![0u8; 65535];
     let mut ctrl_buf = [0u8; 16];
     let requested_ip = requested_ip.filter(|ip| !ip.is_unspecified());
@@ -125,8 +153,12 @@ pub async fn handle_udp_associate(
                     }
                     Some(_) => {}
                 }
+                // Never `.await` here: session establishment (resolve → route
+                // → `dial_udp`) runs inside the per-destination session task,
+                // so one slow or black-holed destination cannot head-of-line
+                // block the rest of the association (issue #515).
                 if let Err(e) =
-                    handle_client_datagram(tunnel, &relay, &mut nat, &buf[..n], client, inbound).await
+                    handle_client_datagram(&inner, &relay, &mut nat, &buf[..n], client, inbound)
                 {
                     debug!("SOCKS5 UDP datagram from {client}: {e}");
                 }
@@ -134,8 +166,9 @@ pub async fn handle_udp_associate(
             _ = sweeper.tick() => {
                 let idle_ms = meow_tunnel::udp::DEFAULT_UDP_IDLE.as_millis() as u64;
                 nat.retain(|_, session| {
-                    // A dead session (reply task exited) is one-way — evict
-                    // promptly instead of waiting for its next datagram.
+                    // A dead session (task exited — dial failure, write
+                    // error, or reply-reader death) is evicted promptly
+                    // instead of waiting for its next datagram.
                     if session.dead.load(Ordering::Relaxed) {
                         return false;
                     }
@@ -159,19 +192,24 @@ pub async fn handle_udp_associate(
     Ok(())
 }
 
-/// Parse one inbound datagram, route it, and forward it through the (possibly
-/// newly-created) per-destination outbound session.
-async fn handle_client_datagram(
-    tunnel: &Tunnel,
+/// Parse one inbound datagram and hand its payload to the per-destination
+/// session — creating that session's task on first use. Runs synchronously
+/// on the read loop: it never awaits resolution, routing, or `dial_udp`
+/// (issue #515). Per-destination ordering is preserved because every
+/// payload for a destination travels the same FIFO queue.
+fn handle_client_datagram(
+    inner: &Arc<TunnelInner>,
     relay: &Arc<UdpSocket>,
-    nat: &mut HashMap<SocketAddr, Session>,
+    nat: &mut HashMap<SessionKey, Session>,
     datagram: &[u8],
     client: SocketAddr,
     inbound: &Metadata,
 ) -> Result<(), String> {
     let (dst_ip, host, dst_port, data_off) = parse_udp_request(datagram)?;
-
-    let mut metadata = Metadata {
+    if dst_ip.is_none() && host.is_empty() {
+        return Err("UDP request with neither IP nor domain".into());
+    }
+    let metadata = Metadata {
         network: Network::Udp,
         conn_type: ConnType::Socks5,
         src_ip: Some(client.ip()),
@@ -185,85 +223,234 @@ async fn handle_client_datagram(
         ..Default::default()
     };
 
-    let inner = tunnel.inner();
-    inner.pre_handle_metadata(&mut metadata);
-    // UDP keeps the eager pre_resolve (no lazy enrichment): the relay needs
-    // a resolved dst_ip for its session bookkeeping regardless of what the
-    // rules demand.
-    inner.pre_resolve(&mut metadata).await;
-    if metadata.dst_ip.is_none() && !metadata.host.is_empty() {
-        metadata.dst_ip = inner.resolver().resolve_ip_real(&metadata.host).await;
-    }
-
-    let Some(dst_ip) = metadata.dst_ip else {
-        return Err(format!(
-            "dst_ip not resolved for {}",
-            metadata.remote_address()
-        ));
+    // Domain-form destinations key the session by `host:port`: resolution
+    // happens inside the session task, so a slow lookup cannot stall the
+    // read loop, and the session pins the resolved address for its life
+    // (the old per-datagram resolution could churn connections on DNS
+    // round-robin — pinning is what QUIC wants). Two names resolving to
+    // one address now get independent sessions — same routing semantics,
+    // slightly finer dedup granularity. The key is built from the
+    // lowercased `metadata.host` so `EXAMPLE.com` and `example.com` share
+    // one session.
+    let key = match dst_ip {
+        Some(ip) => SessionKey::Addr(SocketAddr::new(ip, dst_port)),
+        None => SessionKey::Host(metadata.host.clone(), dst_port),
     };
-    let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
-    let payload = &datagram[data_off..];
 
-    // Fast path: existing *live* session for this destination. A session
-    // whose reply task exited is one-way — writes would go out on a conn
-    // that can never deliver a reply, so evict it and re-dial below
-    // (issue #514). The check→write window is inherent: if the reply task
-    // dies in between, this datagram is written into a conn that can't
-    // answer — bounded to one packet, the next datagram redials (UDP
-    // semantics tolerate the loss).
-    if nat
-        .get(&dst_addr)
-        .is_some_and(|s| s.dead.load(Ordering::Relaxed))
-    {
-        nat.remove(&dst_addr);
-    }
-    if let Some(session) = nat.get(&dst_addr) {
-        // A write error also means this conn is unusable — remove so the
-        // next datagram redials rather than retrying a dead transport.
-        if let Err(e) = session.conn.write_packet(payload, &dst_addr).await {
-            nat.remove(&dst_addr);
-            return Err(format!("udp write {dst_addr}: {e}"));
+    if let Some(session) = nat.get(&key) {
+        // A dead session (task exited — dial failure, write error, or
+        // upstream close) is evicted so this datagram starts a fresh one
+        // (issue #514).
+        if session.dead.load(Ordering::Relaxed) {
+            nat.remove(&key);
+        } else {
+            // Check capacity before copying the payload onto the queue —
+            // a flooded session drops the datagram without paying the copy.
+            if session.tx.capacity() == 0 {
+                debug!("SOCKS5 UDP session queue full: dropping datagram");
+                return Ok(());
+            }
+            match session
+                .tx
+                .try_send(SmallVec::from_slice(&datagram[data_off..]))
+            {
+                Ok(()) => {
+                    session.last_activity_ms.store(
+                        monotonic_ms() as meow_common::atomic::Uint,
+                        Ordering::Relaxed,
+                    );
+                }
+                // Queue filled between the capacity check and the send:
+                // drop the datagram (UDP semantics — the client retries; a
+                // flooded session must not grow memory unboundedly).
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    debug!("SOCKS5 UDP session queue full: dropping datagram");
+                }
+                // The task exited between the dead check and the send:
+                // evict and start a fresh session with this datagram.
+                Err(mpsc::error::TrySendError::Closed(payload)) => {
+                    nat.remove(&key);
+                    return start_session(inner, relay, nat, key, client, metadata, payload);
+                }
+            }
+            return Ok(());
         }
-        session.last_activity_ms.store(
-            monotonic_ms() as meow_common::atomic::Uint,
-            Ordering::Relaxed,
-        );
-        return Ok(());
     }
 
-    // Client UDP follows the configured routing policy, including port 53.
-    let Some(ResolvedTarget {
-        adapter: proxy,
-        route: _route,
-        ..
-    }) = inner.resolve_proxy(&metadata)
-    else {
-        return Err(format!(
-            "no matching rule for {}",
-            metadata.remote_address()
-        ));
+    start_session(
+        inner,
+        relay,
+        nat,
+        key,
+        client,
+        metadata,
+        SmallVec::from_slice(&datagram[data_off..]),
+    )
+}
+
+/// Insert a new session for `key` whose task performs resolution, routing,
+/// `dial_udp`, and the ordered client→upstream write loop off the read loop.
+/// `first` is the payload that triggered the session (already copied).
+fn start_session(
+    inner: &Arc<TunnelInner>,
+    relay: &Arc<UdpSocket>,
+    nat: &mut HashMap<SessionKey, Session>,
+    key: SessionKey,
+    client: SocketAddr,
+    metadata: Metadata,
+    first: SmallVec<[u8; 1500]>,
+) -> Result<(), String> {
+    // Capacity bound: a unique-destination flood must not grow the table
+    // without bound.
+    if nat.len() >= MAX_SESSIONS {
+        evict_for_admission(nat);
+    }
+
+    let (tx, rx) = mpsc::channel(SESSION_QUEUE);
+    tx.try_send(first)
+        .map_err(|_| "fresh session queue rejected payload".to_string())?;
+
+    let last_activity_ms = Arc::new(AtomicU::new(monotonic_ms() as meow_common::atomic::Uint));
+    let dead = Arc::new(AtomicBool::new(false));
+    let task = tokio::spawn(run_session(
+        Arc::clone(inner),
+        Arc::clone(relay),
+        metadata,
+        client,
+        rx,
+        Arc::clone(&last_activity_ms),
+        Arc::clone(&dead),
+    ))
+    .abort_handle();
+
+    nat.insert(
+        key,
+        Session {
+            tx,
+            last_activity_ms,
+            dead,
+            task,
+        },
+    );
+    Ok(())
+}
+
+/// Make room for one new session (issue #515): dead entries are reclaimed
+/// first — a dead session can no longer deliver traffic either way — then,
+/// if the table is still at `MAX_SESSIONS`, the least-recently-active live
+/// session is evicted (the same LRU-idle policy the sweeper applies on a
+/// timer). Dropping the evicted `Session` aborts its task, which tears
+/// down the reply reader and the outbound conn.
+fn evict_for_admission(nat: &mut HashMap<SessionKey, Session>) {
+    nat.retain(|_, s| !s.dead.load(Ordering::Relaxed));
+    if nat.len() >= MAX_SESSIONS {
+        if let Some(oldest) = nat
+            .iter()
+            .min_by_key(|(_, s)| s.last_activity_ms.load(Ordering::Relaxed))
+            .map(|(k, _)| k.clone())
+        {
+            nat.remove(&oldest);
+        }
+    }
+}
+
+/// One destination's outbound session: resolve → route → `dial_udp`, then
+/// write queued client datagrams in order while a reply task pumps
+/// server→client traffic back. Exiting for any reason marks `dead` so the
+/// next datagram re-establishes (issue #514).
+async fn run_session(
+    inner: Arc<TunnelInner>,
+    relay: Arc<UdpSocket>,
+    mut metadata: Metadata,
+    client: SocketAddr,
+    mut rx: mpsc::Receiver<SmallVec<[u8; 1500]>>,
+    last_activity_ms: Arc<AtomicU>,
+    dead: Arc<AtomicBool>,
+) {
+    // Guard: whatever happens below, mark the session dead on exit so the
+    // read loop evicts it instead of queueing into a closed channel.
+    struct DeadOnExit(Arc<AtomicBool>);
+    impl Drop for DeadOnExit {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let _dead_guard = DeadOnExit(Arc::clone(&dead));
+
+    let outcome = async {
+        inner.pre_handle_metadata(&mut metadata);
+        // UDP keeps the eager pre_resolve (no lazy enrichment): the writer
+        // needs a resolved dst_ip regardless of what the rules demand.
+        inner.pre_resolve(&mut metadata).await;
+        if metadata.dst_ip.is_none() && !metadata.host.is_empty() {
+            metadata.dst_ip = inner.resolver().resolve_ip_real(&metadata.host).await;
+        }
+        let Some(dst_ip) = metadata.dst_ip else {
+            return Err(format!(
+                "dst_ip not resolved for {}",
+                metadata.remote_address()
+            ));
+        };
+        let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
+
+        // Client UDP follows the configured routing policy, including port 53.
+        // `_route` pins this generation's dialer registry across `dial_udp`
+        // (issue #533 review).
+        let Some(ResolvedTarget {
+            adapter: proxy,
+            rule_name,
+            rule_payload,
+            route: _route,
+        }) = inner.resolve_proxy(&metadata).await
+        else {
+            return Err(format!(
+                "no matching rule for {}",
+                metadata.remote_address()
+            ));
+        };
+        info!(
+            "UDP {} --> {} match {}({}) using {}",
+            client,
+            metadata.remote_address(),
+            rule_name,
+            rule_payload,
+            proxy.name()
+        );
+
+        let conn: Arc<dyn meow_common::ProxyPacketConn> = Arc::from(
+            with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata))
+                .await
+                .map_err(|e| format!("dial_udp via {}: {e}", proxy.name()))?,
+        );
+        Ok((conn, dst_addr))
+    }
+    .await;
+
+    let (conn, dst_addr) = match outcome {
+        Ok(v) => v,
+        Err(e) => {
+            // Computed after enrichment so a fake-IP destination logs its
+            // recovered hostname rather than the 198.18.x.x literal.
+            debug!("SOCKS5 UDP session to {}: {e}", metadata.remote_address());
+            return;
+        }
     };
 
-    let conn: Arc<dyn ProxyPacketConn> = Arc::from(
-        with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata))
-            .await
-            .map_err(|e| format!("dial_udp via {}: {e}", proxy.name()))?,
-    );
-
-    conn.write_packet(payload, &dst_addr)
-        .await
-        .map_err(|e| format!("udp initial write {dst_addr}: {e}"))?;
-
-    // Reply task: server→client. Wraps each datagram in the SOCKS5 UDP header
-    // and sends it back to the client's UDP source address.
-    let last_activity_ms = Arc::new(AtomicU::new(monotonic_ms() as meow_common::atomic::Uint));
-    let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let reply_task = {
-        let relay = Arc::clone(relay);
+    // Reply reader: server→client. Wraps each datagram in the SOCKS5 UDP
+    // header and sends it back to the client's UDP source address. The
+    // `select!` below treats its exit as session death (a conn that cannot
+    // deliver replies must be re-dialed, issue #514); the AbortOnDrop guard
+    // kills it if the session task is aborted first.
+    struct AbortOnDrop(tokio::task::AbortHandle);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut reply_task = tokio::spawn({
         let conn = Arc::clone(&conn);
         let last_activity_ms = Arc::clone(&last_activity_ms);
-        let dead = Arc::clone(&dead);
-        tokio::spawn(async move {
+        async move {
             let mut rbuf = vec![0u8; 65535];
             while let Ok((m, src)) = conn.read_packet(&mut rbuf).await {
                 let mut out: SmallVec<[u8; 1500]> = SmallVec::new();
@@ -277,25 +464,38 @@ async fn handle_client_datagram(
                     Ordering::Relaxed,
                 );
             }
-            // The upstream conn errored or closed: mark the session dead so
-            // the next datagram to `dst_addr` re-dials instead of writing
-            // into a conn that can never answer (issue #514).
-            dead.store(true, Ordering::Relaxed);
-            debug!("SOCKS5 UDP session to {dst_addr}: reply task exited; next datagram re-dials");
-        })
-        .abort_handle()
-    };
+        }
+    });
+    let _reply_guard = AbortOnDrop(reply_task.abort_handle());
 
-    nat.insert(
-        dst_addr,
-        Session {
-            conn,
-            last_activity_ms,
-            dead,
-            reply_task,
-        },
-    );
-    Ok(())
+    // Writer loop: drain the queue in FIFO order until the session is
+    // evicted (all senders gone), the upstream write fails, or the reply
+    // reader dies (one-way conn — re-dial on next datagram, issue #514).
+    loop {
+        tokio::select! {
+            queued = rx.recv() => match queued {
+                Some(payload) => {
+                    if let Err(e) = conn.write_packet(&payload, &dst_addr).await {
+                        debug!("SOCKS5 UDP session to {dst_addr}: upstream write: {e}");
+                        return;
+                    }
+                    last_activity_ms.store(
+                        monotonic_ms() as meow_common::atomic::Uint,
+                        Ordering::Relaxed,
+                    );
+                }
+                None => return, // all senders dropped — session evicted
+            },
+            done = &mut reply_task => {
+                let reason = match done {
+                    Ok(()) => "reply reader exited".to_string(),
+                    Err(e) => format!("reply reader task: {e}"),
+                };
+                debug!("SOCKS5 UDP session to {dst_addr}: {reason}; next datagram re-dials");
+                return;
+            }
+        }
+    }
 }
 
 /// Write the `CMD UDP ASSOCIATE` success reply carrying the relay endpoint.
@@ -436,7 +636,7 @@ mod tests {
         async fn dial_udp(
             &self,
             _metadata: &Metadata,
-        ) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
             self.dials.fetch_add(1, Ordering::Relaxed);
             Ok(Box::new(DeadReadConn))
         }
@@ -463,9 +663,23 @@ mod tests {
         }
     }
 
-    /// Issue #514: when the reply task dies (upstream read failure) the
-    /// session stays in the NAT map today, so further datagrams write into a
-    /// conn that can never answer. It must be evicted and re-dialed.
+    /// Spin until `cond` holds or `dur` elapses (for assertions on state
+    /// mutated by the spawned session tasks).
+    async fn eventually(dur: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + dur;
+        while tokio::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        cond()
+    }
+
+    /// Issue #514: when the session task dies (upstream read failure) the
+    /// next datagram to that destination must evict it and re-dial rather
+    /// than queue into a conn that can never answer.
     #[tokio::test]
     async fn dead_reply_task_session_is_evicted_and_redialed() {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -494,44 +708,187 @@ mod tests {
             ))]);
 
             let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-            let mut nat: HashMap<SocketAddr, Session> = HashMap::new();
+            let inner = Arc::clone(tunnel.inner());
+            let mut nat: HashMap<SessionKey, Session> = HashMap::new();
             let client: SocketAddr = "127.0.0.1:40000".parse().unwrap();
             let inbound = Metadata::default();
             let dst: SocketAddr = "1.2.3.4:443".parse().unwrap();
+            let key = SessionKey::Addr(dst);
             let mut packet: SmallVec<[u8; 1500]> = SmallVec::new();
             encode_udp_header(&mut packet, &dst);
             packet.extend_from_slice(b"payload");
 
-            handle_client_datagram(&tunnel, &relay, &mut nat, &packet, client, &inbound)
-                .await
-                .unwrap();
-            assert_eq!(proxy.dials.load(Ordering::Relaxed), 1);
-            assert!(nat.contains_key(&dst));
+            handle_client_datagram(&inner, &relay, &mut nat, &packet, client, &inbound).unwrap();
+            assert!(nat.contains_key(&key));
+            // The dial runs inside the session task now — wait for it.
+            assert!(
+                eventually(Duration::from_secs(2), || {
+                    proxy.dials.load(Ordering::Relaxed) == 1
+                })
+                .await,
+                "session task never dialed"
+            );
 
-            // The reply task observes the read error and marks the session.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-            while !nat.get(&dst).unwrap().dead.load(Ordering::Relaxed) {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "dead flag never set"
-                );
-                tokio::task::yield_now().await;
-            }
+            // The reply reader observes the upstream read error and exits;
+            // the session task treats that as session death.
+            assert!(
+                eventually(Duration::from_secs(2), || {
+                    nat.get(&key).is_none_or(|s| s.dead.load(Ordering::Relaxed))
+                })
+                .await,
+                "dead flag never set"
+            );
 
             // The next datagram to the same destination must re-dial rather
-            // than write into the dead conn.
-            handle_client_datagram(&tunnel, &relay, &mut nat, &packet, client, &inbound)
-                .await
-                .unwrap();
-            assert_eq!(
-                proxy.dials.load(Ordering::Relaxed),
-                2,
+            // than queue into the dead session.
+            handle_client_datagram(&inner, &relay, &mut nat, &packet, client, &inbound).unwrap();
+            assert!(
+                eventually(Duration::from_secs(2), || {
+                    proxy.dials.load(Ordering::Relaxed) == 2
+                })
+                .await,
                 "datagram to a dead session must re-dial"
             );
-            assert!(nat.contains_key(&dst));
+            assert!(nat.contains_key(&key));
         })
         .await
         .expect("session re-dial timed out");
+    }
+
+    /// Mock `Proxy` whose `dial_udp` for port 4443 blocks on a gate while
+    /// every other destination dials instantly — reproduces the issue #515
+    /// repro where one slow destination stalled the whole association.
+    struct GatedDialProxy {
+        gate: tokio::sync::Notify,
+        dialed_ports: std::sync::Mutex<Vec<u16>>,
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for GatedDialProxy {
+        fn name(&self) -> &str {
+            "gated-udp"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported("no tcp".into()))
+        }
+        async fn dial_udp(
+            &self,
+            metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            if metadata.dst_port == 4443 {
+                self.gate.notified().await; // slow destination: parks until released
+            }
+            self.dialed_ports.lock().unwrap().push(metadata.dst_port);
+            Ok(Box::new(DeadReadConn))
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl meow_common::Proxy for GatedDialProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// Issue #515: with session establishment off the read loop, a datagram
+    /// to a fast destination must complete its dial while a slow
+    /// destination's dial is still in flight. Previously
+    /// `handle_client_datagram` was awaited inline and dst2 blocked behind
+    /// dst1's 2 s `dial_udp`.
+    #[tokio::test]
+    async fn slow_destination_does_not_block_other_destinations() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let proxy = Arc::new(GatedDialProxy {
+                gate: tokio::sync::Notify::new(),
+                dialed_ports: std::sync::Mutex::new(Vec::new()),
+                health: meow_common::ProxyHealth::new(),
+            });
+            let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+                vec![],
+                vec![],
+                meow_common::DnsMode::Normal,
+                meow_trie::DomainTrie::new(),
+                false,
+                true,
+            ));
+            let tunnel = meow_tunnel::Tunnel::new(resolver);
+            let rebuilt = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+            let mut proxies = rebuilt.proxies;
+            proxies.insert(
+                "gated-udp".into(),
+                Arc::clone(&proxy) as Arc<dyn meow_common::Proxy>,
+            );
+            tunnel.update_proxies(proxies, rebuilt.dialer_registry);
+            tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+                "gated-udp",
+            ))]);
+
+            let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let inner = Arc::clone(tunnel.inner());
+            let mut nat: HashMap<SessionKey, Session> = HashMap::new();
+            let client: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+            let inbound = Metadata::default();
+
+            let slow: SocketAddr = "1.2.3.4:4443".parse().unwrap();
+            let fast: SocketAddr = "5.6.7.8:443".parse().unwrap();
+            for dst in [slow, fast] {
+                let mut packet: SmallVec<[u8; 1500]> = SmallVec::new();
+                encode_udp_header(&mut packet, &dst);
+                packet.extend_from_slice(b"payload");
+                // Synchronous dispatch — must return immediately even while
+                // the slow session's dial is parked on the gate.
+                handle_client_datagram(&inner, &relay, &mut nat, &packet, client, &inbound)
+                    .unwrap();
+            }
+
+            // The fast destination's session task dials promptly even though
+            // the slow one's dial is still gated.
+            assert!(
+                eventually(Duration::from_secs(2), || {
+                    proxy.dialed_ports.lock().unwrap().contains(&443)
+                })
+                .await,
+                "fast destination's dial blocked behind the slow one"
+            );
+
+            proxy.gate.notify_waiters();
+            assert!(
+                eventually(Duration::from_secs(2), || {
+                    proxy.dialed_ports.lock().unwrap().contains(&4443)
+                })
+                .await,
+                "slow destination never dialed after the gate opened"
+            );
+        })
+        .await
+        .expect("HOL-blocking regression test timed out");
     }
 
     #[tokio::test]
@@ -646,5 +1003,429 @@ mod tests {
         assert_eq!(ip, Some(src.ip()));
         assert_eq!(port, src.port());
         assert_eq!(&out[off..], b"data");
+    }
+
+    /// Insert `n` stub sessions into `nat`; `dead` marks the last `dead`
+    /// entries dead. Activity stamps are `index + 1` (index 0 is the least
+    /// recently active) so tests can insert a strictly-older stamp-0 entry.
+    fn stub_nat(n: usize, dead: usize) -> HashMap<SessionKey, Session> {
+        let mut nat = HashMap::new();
+        for i in 0..n {
+            let (tx, _rx) = mpsc::channel(1);
+            nat.insert(
+                SessionKey::Addr(SocketAddr::from(([10, 0, 0, 1], 20000 + i as u16))),
+                Session {
+                    tx,
+                    last_activity_ms: Arc::new(AtomicU::new((i + 1) as meow_common::atomic::Uint)),
+                    dead: Arc::new(AtomicBool::new(i >= n - dead)),
+                    task: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+                },
+            );
+        }
+        nat
+    }
+
+    /// Capacity bound (issue #515): admission at `MAX_SESSIONS` reclaims
+    /// dead entries before touching live ones.
+    #[tokio::test]
+    async fn evict_for_admission_reclaims_dead_sessions_first() {
+        let mut nat = stub_nat(MAX_SESSIONS, 5);
+        evict_for_admission(&mut nat);
+        assert_eq!(nat.len(), MAX_SESSIONS - 5, "only dead entries removed");
+        assert!(nat.values().all(|s| !s.dead.load(Ordering::Relaxed)));
+    }
+
+    /// With no dead entries to reclaim, the least-recently-active live
+    /// session is the eviction victim.
+    #[tokio::test]
+    async fn evict_for_admission_evicts_lru_session() {
+        let mut nat = stub_nat(MAX_SESSIONS, 0);
+        let oldest = SessionKey::Addr(SocketAddr::from(([10, 0, 0, 1], 20000)));
+        evict_for_admission(&mut nat);
+        assert_eq!(nat.len(), MAX_SESSIONS - 1);
+        assert!(
+            !nat.contains_key(&oldest),
+            "the least-recently-active session must be the victim"
+        );
+    }
+
+    /// Dropping the evicted `Session` aborts its task — verify via the
+    /// JoinHandle resolving as cancelled.
+    #[tokio::test]
+    async fn evicted_session_aborts_its_task() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let mut nat = stub_nat(MAX_SESSIONS - 1, 0);
+        let (tx, _rx) = mpsc::channel(1);
+        let key = SessionKey::Addr(SocketAddr::from(([10, 9, 9, 9], 53)));
+        nat.insert(
+            key.clone(),
+            Session {
+                tx,
+                last_activity_ms: Arc::new(AtomicU::new(0)), // oldest → victim
+                dead: Arc::new(AtomicBool::new(false)),
+                task: task.abort_handle(),
+            },
+        );
+        evict_for_admission(&mut nat);
+        assert!(!nat.contains_key(&key));
+        let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("evicted session's task never finished")
+            .expect_err("evicted session's task must be cancelled");
+        assert!(outcome.is_cancelled());
+    }
+
+    /// Issue #515: the `nat.len() >= MAX_SESSIONS` admission guard inside
+    /// `start_session` itself — remove it and this fails even though the
+    /// `evict_for_admission` unit tests still pass.
+    #[tokio::test]
+    async fn start_session_admission_holds_the_table_cap() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+                vec![],
+                vec![],
+                meow_common::DnsMode::Normal,
+                meow_trie::DomainTrie::new(),
+                false,
+                true,
+            ));
+            let tunnel = meow_tunnel::Tunnel::new(resolver);
+            let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let inner = Arc::clone(tunnel.inner());
+
+            let mut nat = stub_nat(MAX_SESSIONS, 0);
+            let key = SessionKey::Addr(SocketAddr::from(([192, 0, 2, 1], 443)));
+            let client: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+            start_session(
+                &inner,
+                &relay,
+                &mut nat,
+                key.clone(),
+                client,
+                Metadata::default(),
+                SmallVec::from_slice(b"payload"),
+            )
+            .unwrap();
+
+            assert!(
+                nat.len() <= MAX_SESSIONS,
+                "admission must not grow the table past MAX_SESSIONS"
+            );
+            assert!(nat.contains_key(&key), "the new session was admitted");
+        })
+        .await
+        .expect("admission test timed out");
+    }
+
+    /// Mock conn whose `read_packet` pends forever (keeping the session
+    /// alive) and whose `write_packet` records payloads once `write_gate`
+    /// opens — the session's FIFO drain and queue bound are observable
+    /// through `writes`.
+    struct RecordingConn {
+        writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        write_gate: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyPacketConn for RecordingConn {
+        async fn read_packet(&self, _buf: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+        async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> meow_common::Result<usize> {
+            let mut gate = self.write_gate.clone();
+            while !*gate.borrow_and_update() {
+                if gate.changed().await.is_err() {
+                    break;
+                }
+            }
+            self.writes.lock().unwrap().push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+            Ok("127.0.0.1:0".parse().unwrap())
+        }
+        fn close(&self) -> meow_common::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `dial_udp` parks until `dial_gate` opens, then yields a
+    /// [`RecordingConn`] — letting a test queue datagrams deterministically
+    /// before any write can run.
+    struct GatedRecordingProxy {
+        dial_gate: tokio::sync::watch::Receiver<bool>,
+        write_gate: tokio::sync::watch::Receiver<bool>,
+        writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for GatedRecordingProxy {
+        fn name(&self) -> &str {
+            "gated-recording"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported("no tcp".into()))
+        }
+        async fn dial_udp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            let mut gate = self.dial_gate.clone();
+            while !*gate.borrow_and_update() {
+                if gate.changed().await.is_err() {
+                    break;
+                }
+            }
+            Ok(Box::new(RecordingConn {
+                writes: Arc::clone(&self.writes),
+                write_gate: self.write_gate.clone(),
+            }))
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl meow_common::Proxy for GatedRecordingProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// Issue #515's core claims made observable: datagrams queued while the
+    /// session dials are written in FIFO order, and a full 64-deep queue
+    /// drops extras without killing the session.
+    #[tokio::test]
+    async fn session_queue_preserves_order_and_bounds() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (dial_open, dial_gate) = tokio::sync::watch::channel(false);
+            let (write_open, write_gate) = tokio::sync::watch::channel(true);
+            let writes = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+            let proxy = Arc::new(GatedRecordingProxy {
+                dial_gate,
+                write_gate,
+                writes: Arc::clone(&writes),
+                health: meow_common::ProxyHealth::new(),
+            });
+            let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+                vec![],
+                vec![],
+                meow_common::DnsMode::Normal,
+                meow_trie::DomainTrie::new(),
+                false,
+                true,
+            ));
+            let tunnel = meow_tunnel::Tunnel::new(resolver);
+            let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+            let mut proxies = res.proxies;
+            proxies.insert(
+                "gated-recording".into(),
+                Arc::clone(&proxy) as Arc<dyn meow_common::Proxy>,
+            );
+            tunnel.update_proxies(proxies, res.dialer_registry);
+            tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+                "gated-recording",
+            ))]);
+
+            let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let inner = Arc::clone(tunnel.inner());
+            let mut nat: HashMap<SessionKey, Session> = HashMap::new();
+            let client: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+            let inbound = Metadata::default();
+            let dst: SocketAddr = "1.2.3.4:443".parse().unwrap();
+            let key = SessionKey::Addr(dst);
+            let packet = |payload: &[u8]| {
+                let mut p: SmallVec<[u8; 1500]> = SmallVec::new();
+                encode_udp_header(&mut p, &dst);
+                p.extend_from_slice(payload);
+                p
+            };
+
+            // Phase 1 — ordering: the dial is parked, so every datagram
+            // queues; once released they must reach the conn in FIFO order.
+            for payload in [b"p1".as_slice(), b"p2", b"p3"] {
+                handle_client_datagram(
+                    &inner,
+                    &relay,
+                    &mut nat,
+                    &packet(payload),
+                    client,
+                    &inbound,
+                )
+                .unwrap();
+            }
+            assert!(nat.contains_key(&key));
+            dial_open.send(true).unwrap();
+            assert!(
+                eventually(Duration::from_secs(2), || {
+                    writes.lock().unwrap().len() == 3
+                })
+                .await,
+                "queued datagrams never reached the conn"
+            );
+            assert_eq!(
+                writes.lock().unwrap().as_slice(),
+                &[b"p1".as_slice(), b"p2", b"p3"],
+                "per-destination ordering must be preserved through establishment"
+            );
+
+            // Phase 2 — the bound: park the write path, refill the queue to
+            // its full 64-datagram depth, then send extras that must drop.
+            write_open.send(false).unwrap();
+            handle_client_datagram(
+                &inner,
+                &relay,
+                &mut nat,
+                &packet(b"parked"),
+                client,
+                &inbound,
+            )
+            .unwrap();
+            // Wait until the writer consumed "parked" into write_packet —
+            // the queue is empty again at that point (capacity back to 64).
+            assert!(
+                eventually(Duration::from_secs(2), || {
+                    nat.get(&key).unwrap().tx.capacity() == SESSION_QUEUE
+                })
+                .await,
+                "writer never consumed the parked datagram"
+            );
+            for i in 0..SESSION_QUEUE {
+                let payload = vec![b'q', i as u8];
+                handle_client_datagram(
+                    &inner,
+                    &relay,
+                    &mut nat,
+                    &packet(&payload),
+                    client,
+                    &inbound,
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                nat.get(&key).unwrap().tx.capacity(),
+                0,
+                "queue must be full"
+            );
+            // Five more datagrams: all dropped, session alive.
+            for _ in 0..5 {
+                handle_client_datagram(&inner, &relay, &mut nat, &packet(b"x"), client, &inbound)
+                    .unwrap();
+            }
+            write_open.send(true).unwrap();
+            // The parked write + the 64 queued drain; the 5 extras are gone.
+            let want_total = 3 + 1 + SESSION_QUEUE;
+            assert!(
+                eventually(Duration::from_secs(2), || {
+                    writes.lock().unwrap().len() == want_total
+                })
+                .await,
+                "queue must drain exactly its capacity, extras dropped"
+            );
+            let recorded = writes.lock().unwrap();
+            assert_eq!(recorded[3].as_slice(), b"parked");
+            assert_eq!(recorded[4].as_slice(), b"q\x00".as_slice());
+            assert_eq!(recorded[4 + SESSION_QUEUE - 1].as_slice(), &[b'q', 63]);
+            assert!(
+                nat.contains_key(&key),
+                "a full queue must not kill the session"
+            );
+        })
+        .await
+        .expect("queue ordering/bounds test timed out");
+    }
+
+    /// Issue #514/#515: evicting a session while its task is parked inside
+    /// `dial_udp` must abort the task, not let the establishment complete
+    /// and leak a detached conn.
+    #[tokio::test]
+    async fn evict_during_dial_aborts_the_task() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (dial_open, dial_gate) = tokio::sync::watch::channel(false);
+            let (_write_open, write_gate) = tokio::sync::watch::channel(true);
+            let proxy = Arc::new(GatedRecordingProxy {
+                dial_gate,
+                write_gate,
+                writes: Arc::new(std::sync::Mutex::new(Vec::new())),
+                health: meow_common::ProxyHealth::new(),
+            });
+            let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+                vec![],
+                vec![],
+                meow_common::DnsMode::Normal,
+                meow_trie::DomainTrie::new(),
+                false,
+                true,
+            ));
+            let tunnel = meow_tunnel::Tunnel::new(resolver);
+            let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+            let mut proxies = res.proxies;
+            proxies.insert(
+                "gated-recording".into(),
+                Arc::clone(&proxy) as Arc<dyn meow_common::Proxy>,
+            );
+            tunnel.update_proxies(proxies, res.dialer_registry);
+            tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+                "gated-recording",
+            ))]);
+
+            let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let inner = Arc::clone(tunnel.inner());
+            let mut nat: HashMap<SessionKey, Session> = HashMap::new();
+            let client: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+            let dst: SocketAddr = "1.2.3.4:443".parse().unwrap();
+            let key = SessionKey::Addr(dst);
+            let mut packet: SmallVec<[u8; 1500]> = SmallVec::new();
+            encode_udp_header(&mut packet, &dst);
+            packet.extend_from_slice(b"payload");
+
+            handle_client_datagram(
+                &inner,
+                &relay,
+                &mut nat,
+                &packet,
+                client,
+                &Metadata::default(),
+            )
+            .unwrap();
+            // Give the task a scheduling slot to reach the parked dial.
+            tokio::task::yield_now().await;
+            let session = nat.remove(&key).expect("session must exist");
+            let handle = session.task.clone();
+            drop(session);
+            assert!(
+                eventually(Duration::from_secs(2), || handle.is_finished()).await,
+                "evicting mid-dial must abort the session task"
+            );
+            // Releasing the dial gate afterwards must not resurrect anything.
+            dial_open.send(true).unwrap();
+        })
+        .await
+        .expect("mid-dial eviction test timed out");
     }
 }
