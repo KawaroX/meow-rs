@@ -30,6 +30,12 @@ struct FingerprintParams {
     /// not controlled by this string.
     cipher_list: &'static str,
     /// OpenSSL curve-list string (e.g. `"X25519:P-256:P-384"`).
+    /// Invariant: every shipped profile must stay hybrid-PQ-free — the
+    /// shadow-tls v2 pin lifts for *known* fingerprints on the assumption
+    /// that a resolved profile never offers `X25519MLKEM768` /
+    /// `P256Kyber768Draft00` (upstream strips them surgically; we have no
+    /// per-group strip).  A future ML-KEM-carrying parrot would need the
+    /// pin decision in `tls_config_for` revisited.
     curves_list: &'static str,
     /// Inject GREASE values in ciphers, extensions, and named groups.
     /// Also enables ECH GREASE automatically.
@@ -240,10 +246,24 @@ const EDGE: FingerprintParams = FingerprintParams {
 
 /// Resolve a fingerprint string to its `FingerprintParams`.
 ///
-/// Returns `None` for deferred/unknown profiles — caller should fall through
-/// to `warn_fingerprint_once` (not applicable in the boring path, but kept
-/// for exhaustiveness).
+/// Returns `None` for deferred/unknown profiles — `build_connector` warns
+/// and falls back to BoringSSL defaults for those.
 fn resolve_fingerprint(fp: &str) -> Option<&'static FingerprintParams> {
+    if fp == "random" {
+        // Weighted random at construction: chrome(6) safari(3) ios(2) firefox(1).
+        // Use a simple modulo on a thread-local random u8.
+        let v: u8 = rand::random();
+        return Some(match v % 12 {
+            0..=5 => &CHROME,
+            6..=8 => &SAFARI,
+            9..=10 => &IOS,
+            _ => &FIREFOX,
+        });
+    }
+    resolve_named_fingerprint(fp)
+}
+
+fn resolve_named_fingerprint(fp: &str) -> Option<&'static FingerprintParams> {
     match fp {
         "chrome" | "chrome120" => Some(&CHROME),
         "firefox" | "firefox120" => Some(&FIREFOX),
@@ -251,19 +271,16 @@ fn resolve_fingerprint(fp: &str) -> Option<&'static FingerprintParams> {
         "ios" => Some(&IOS),
         "android" => Some(&ANDROID),
         "edge" => Some(&EDGE),
-        "random" => {
-            // Weighted random at construction: chrome(6) safari(3) ios(2) firefox(1).
-            // Use a simple modulo on a thread-local random u8.
-            let v: u8 = rand::random();
-            Some(match v % 12 {
-                0..=5 => &CHROME,
-                6..=8 => &SAFARI,
-                9..=10 => &IOS,
-                _ => &FIREFOX,
-            })
-        }
         _ => None,
     }
+}
+
+/// Whether `fp` names a fingerprint this backend actually shapes —
+/// `random` counts (it always resolves to a real profile).  Pure
+/// counterpart of [`resolve_fingerprint`]: it must not consume the
+/// weighted pick, so it matches names rather than resolving.
+pub(crate) fn fingerprint_is_known(fp: &str) -> bool {
+    fp == "random" || resolve_named_fingerprint(fp).is_some()
 }
 
 /// Process-global parsed Mozilla CA roots. Parsed once from DER; each `X509`
@@ -314,9 +331,9 @@ pub(crate) fn build_root_store(
 #[derive(PartialEq, Eq, Hash)]
 struct ConnectorKey {
     fingerprint: Option<String>,
+    curves: Option<String>,
     alpn: Vec<String>,
     skip_cert_verify: bool,
-    curves_list: Option<String>,
 }
 
 /// Process-wide cache of BoringSSL `SslConnector`s.
@@ -346,9 +363,9 @@ fn shared_connector(config: &TlsConfig) -> Result<boring::ssl::SslConnector> {
 
     let key = ConnectorKey {
         fingerprint: config.fingerprint.clone(),
+        curves: config.curves.clone(),
         alpn: config.alpn.clone(),
         skip_cert_verify: config.skip_cert_verify,
-        curves_list: config.curves_list.clone(),
     };
     let cache = CONNECTOR_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     {
@@ -397,10 +414,11 @@ impl BoringInner {
     /// Everything that can make [`Self::build_connector`] fail is checked
     /// here so `TlsLayer::new` reports it at startup: `sni`, ALPN entry lengths (the wire format
     /// carries a one-byte length prefix), and — for the rare configs that
-    /// carry `additional_roots` / `client_cert` — a full dry-run build, since
-    /// DER/PEM parse errors are only discoverable by parsing.  Those configs
-    /// bypass the connector cache anyway, so the dry run costs one extra
-    /// `SSL_CTX` at startup and nothing on the dial path.
+    /// carry `additional_roots` / `client_cert` / `curves` — a full dry-run
+    /// build, since DER/PEM parse errors and an unparsable curve list are
+    /// only discoverable by building.  The first two bypass the connector
+    /// cache anyway; `curves` configs pay one extra `SSL_CTX` at startup
+    /// and nothing on the dial path.
     pub(super) fn validate(config: &TlsConfig) -> Result<()> {
         if config.sni.is_none() {
             return Err(TransportError::Config(
@@ -449,7 +467,10 @@ impl BoringInner {
                 "ech requires TLS 1.3 but max_version caps at TLS 1.2".into(),
             ));
         }
-        if !config.additional_roots.is_empty() || config.client_cert.is_some() {
+        if !config.additional_roots.is_empty()
+            || config.client_cert.is_some()
+            || config.curves.is_some()
+        {
             Self::build_connector(config)?;
         }
         Ok(())
@@ -504,9 +525,15 @@ impl BoringInner {
             }
         }
 
-        // Explicit curves override — applied after fingerprint shaping so
-        // it wins over the profile's list (see TlsConfig::curves_list).
-        if let Some(curves) = &config.curves_list {
+        // ── supported_groups override ────────────────────────────────────────
+        // An explicit `curves` list applies after — and therefore overrides —
+        // a resolved fingerprint profile's own list.  shadow-tls v2 uses it
+        // only when no profile resolved (its pin would otherwise clobber
+        // firefox/android's distinct group lists); upstream's
+        // `BuildRemovedX25519MLKEM768HandshakeState` removes the hybrid-PQ
+        // group surgically post-uTLS, which our whole-list override can only
+        // express as a fallback for the unshaped default hello.
+        if let Some(curves) = &config.curves {
             b.set_curves_list(curves)
                 .map_err(|e| TransportError::Config(format!("boring: set_curves_list: {e}")))?;
         }
@@ -732,7 +759,14 @@ impl BoringInner {
                 // `connect()` uses them. The current attempt still fails — the
                 // inner stream is already consumed by `tokio_boring::connect`,
                 // so we cannot re-dial here.
-                if ech_requested {
+                // The retry-configs read MUST be gated on a real
+                // `SSL_R_ECH_REJECTED` failure: `SSL_get0_ech_retry_configs`
+                // is only valid for an authenticated ECH rejection — called
+                // on any other failure (cert verify, reset mid-handshake) it
+                // aborts debug builds and returns a non-empty garbage
+                // placeholder that would poison `self.ech` for every
+                // subsequent connect.
+                if ech_requested && handshake_failed_ech_rejected(&e) {
                     if let Some(retry_configs) = e.ssl().and_then(|ssl| ssl.get_ech_retry_configs())
                     {
                         if !retry_configs.is_empty() {
@@ -761,6 +795,23 @@ impl BoringInner {
             }
         }
     }
+}
+
+/// True when `e` is a mid-handshake failure carrying `SSL_R_ECH_REJECTED`
+/// — the only state where `get_ech_retry_configs` is legal.
+fn handshake_failed_ech_rejected<S>(e: &tokio_boring::HandshakeError<S>) -> bool {
+    // `HandshakeError::ssl()` is `Some` only for a mid-handshake Failure —
+    // a SetupFailure (pre-handshake, no ECH attempted) must not consult the
+    // stored error. `code() == SSL` narrows to SSL-library failures (an
+    // ECH rejection is always SSL_ERROR_SSL, never SYSCALL), and the
+    // Display embeds the registered reason-code name `[ECH_REJECTED]` —
+    // tokio-boring exposes reason codes only through `Error::source()`,
+    // which requires `S: Debug` that `connect_typed`'s generic streams
+    // don't have. `ECH_REJECTED` is a canonical reason symbol, not
+    // free-form text, so it cannot collide with unrelated errors.
+    e.ssl().is_some()
+        && e.code() == Some(boring::ssl::ErrorCode::SSL)
+        && e.to_string().contains("ECH_REJECTED")
 }
 
 /// Defers BoringSSL `SslConnector` construction to the first `connect()` call,
@@ -957,8 +1008,9 @@ mod tests {
         std::ptr::eq(a.context(), b.context())
     }
 
-    /// Same (fingerprint, alpn, skip_cert_verify) → same shared `SSL_CTX`;
-    /// different key → different context; uncacheable configs bypass the cache.
+    /// Same (fingerprint, curves, alpn, skip_cert_verify) → same shared
+    /// `SSL_CTX`; different key → different context; uncacheable configs
+    /// bypass the cache.
     #[test]
     fn boring_connector_is_shared_per_key() {
         let a = shared_connector(&TlsConfig::new("a.example")).expect("build a");
@@ -997,6 +1049,25 @@ mod tests {
             "same fingerprint must share the SSL_CTX"
         );
 
+        let curves = shared_connector(&TlsConfig {
+            curves: Some("X25519:P-256:P-384".into()),
+            ..TlsConfig::new("g.example")
+        })
+        .expect("build curves");
+        assert!(
+            !same_ctx(&a, &curves),
+            "explicit curves must build a distinct SSL_CTX"
+        );
+        let curves2 = shared_connector(&TlsConfig {
+            curves: Some("P-256:X25519".into()),
+            ..TlsConfig::new("h.example")
+        })
+        .expect("build curves2");
+        assert!(
+            !same_ctx(&curves, &curves2),
+            "different curves lists must build distinct SSL_CTXs"
+        );
+
         let skip = shared_connector(&TlsConfig {
             skip_cert_verify: true,
             ..TlsConfig::new("f.example")
@@ -1023,6 +1094,43 @@ mod tests {
         // Re-asking for an existing key hits the cache.
         let a2 = shared_connector(&TlsConfig::new("i.example")).expect("build a2");
         assert!(same_ctx(&a, &a2));
+    }
+
+    /// The shadow-tls v2 pin lifts for *known* fingerprints on the
+    /// assumption that every shipped profile is hybrid-PQ-free — upstream
+    /// strips `X25519MLKEM768`/`P256Kyber768Draft00` surgically after uTLS
+    /// shaping, which our whole-list `curves` override cannot express.  If
+    /// a future parrot adds a PQ group, this test fails loudly and the pin
+    /// decision in `meow-proxy`'s `tls_config_for` must be revisited.
+    #[test]
+    fn all_named_profiles_are_hybrid_pq_free() {
+        for name in [
+            "chrome",
+            "chrome120",
+            "firefox",
+            "firefox120",
+            "safari",
+            "safari16",
+            "ios",
+            "android",
+            "edge",
+        ] {
+            let p = resolve_named_fingerprint(name).expect("named profile");
+            assert!(
+                !p.curves_list.contains("MLKEM") && !p.curves_list.contains("KYBER"),
+                "profile {name} carries a hybrid-PQ group ({}) — the \
+                 shadow-tls v2 conditional pin would lift and leak it",
+                p.curves_list
+            );
+        }
+        // The `random` pool must be covered by the same invariant.
+        for p in [&CHROME, &SAFARI, &IOS, &FIREFOX] {
+            assert!(
+                !p.curves_list.contains("MLKEM") && !p.curves_list.contains("KYBER"),
+                "random-pool profile carries a hybrid-PQ group ({})",
+                p.curves_list
+            );
+        }
     }
 
     /// Knobs for `make_cert` — keep the common leaf case terse.

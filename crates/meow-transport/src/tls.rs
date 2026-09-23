@@ -36,9 +36,10 @@
 //! # Connector sharing
 //!
 //! The per-process BoringSSL `SSL_CTX` is memoised keyed on the
-//! [`TlsConfig`] fields that shape it (`fingerprint`, `alpn`,
-//! `skip_cert_verify`).  A subscription with hundreds of TLS proxies
-//! therefore costs one context per distinct key rather than one per proxy.
+//! [`TlsConfig`] fields that shape it (`fingerprint`, `curves`,
+//! `alpn`, `skip_cert_verify`).  A subscription with hundreds of TLS
+//! proxies therefore costs one context per distinct key rather than
+//! one per proxy.
 //! Configs carrying `additional_roots` / `client_cert` (or the
 //! per-construction `random` fingerprint) bypass the cache.
 
@@ -56,7 +57,9 @@ use boring_backend::{BoringInner, LazyBoringInner};
 /// Source of the ECH config list.
 ///
 /// DNS-sourced ECH (`ech-opts.enable = true` without `ech-opts.config`) is
-/// deferred until `meow-dns` gains SVCB/HTTPS record support.
+/// resolved by `meow_config::ech_dns` before this layer is built — the DNS
+/// HTTPS-record answer lands here as `Config` bytes, so the enum only ever
+/// carries an inline list.
 #[derive(Debug, Clone)]
 pub enum EchOpts {
     /// Inline ECH config list bytes, base64-decoded by `meow-config` before
@@ -137,15 +140,15 @@ pub struct TlsConfig {
     /// defaults.
     pub fingerprint: Option<String>,
 
-    /// Explicit supported-groups list override (BoringSSL
-    /// `set_curves_list` syntax, e.g. `"X25519:P-256:P-384"`).
-    /// `None` = BoringSSL default.  Applied after `fingerprint` shaping,
-    /// so it wins over the profile's own curve list — shadow-tls v2 uses
-    /// it to drop `X25519MLKEM768` when no fingerprint is shaping the
-    /// ClientHello anyway (a hybrid-PQ keyshare breaks v2 servers;
-    /// upstream parity with mihomo's `HelloChrome_Auto → HelloChrome_120`
-    /// swap).
-    pub curves_list: Option<String>,
+    /// `supported_groups` override (BoringSSL colon-separated names, e.g.
+    /// `"X25519:P-256:P-384"`).  `None` → BoringSSL's default — which in
+    /// the BoringSSL vendored by boring-sys ≥5.x includes the
+    /// `X25519MLKEM768` post-quantum key share (boring-pq.patch).
+    /// Protocols that must not offer hybrid PQ (shadow-tls v2: upstream
+    /// strips it because it breaks v2 servers) pin a classic list here.
+    /// Applied after — and therefore overriding — a resolved
+    /// [`fingerprint`](Self::fingerprint) profile's own curve list.
+    pub curves: Option<String>,
 
     /// Extra CA certificates (DER-encoded) added to the root store in
     /// addition to `webpki-roots`.  Used in tests with self-signed certs;
@@ -155,7 +158,7 @@ pub struct TlsConfig {
     /// ECH config source.
     ///
     /// `Some(EchOpts::Config(bytes))` → inline ECH config list.
-    /// DNS-sourced ECH is deferred; see [`EchOpts`].
+    /// DNS-sourced ECH arrives here already resolved; see [`EchOpts`].
     ///
     /// Applied per connection by BoringSSL; a server `ech_required`
     /// rejection rotates the stored config to the supplied `retry_configs`.
@@ -181,12 +184,23 @@ impl TlsConfig {
             cert_pin: None,
             client_cert: None,
             fingerprint: None,
-            curves_list: None,
+            curves: None,
             additional_roots: Vec::new(),
             ech: None,
             reality: None,
         }
     }
+}
+
+/// Whether `fp` names a uTLS fingerprint profile the boring backend
+/// actually shapes (`chrome`, `firefox`, `safari`, `ios`, `android`,
+/// `edge`, `random`, plus version-pinned aliases).  Unknown names fall
+/// back to BoringSSL defaults with a warning — callers that must reason
+/// about the *effective* ClientHello (e.g. shadow-tls v2's ML-KEM pin)
+/// use this to tell a resolved profile's own group list from the
+/// default hello.
+pub fn is_supported_fingerprint(fp: &str) -> bool {
+    boring_backend::fingerprint_is_known(fp)
 }
 
 /// TLS protocol version bound for [`TlsConfig::min_version`] /
