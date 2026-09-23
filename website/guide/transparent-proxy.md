@@ -59,9 +59,11 @@ routing-mark: 9527     # Linux: SO_MARK for loop avoidance
 
 ## How tproxy works
 
-- **REDIRECT-based, TCP only.** Traffic is redirected to the TProxy listener, and the
-  original destination is recovered via `SO_ORIGINAL_DST` (Linux) or a pf
-  state-table lookup (`DIOCNATLOOK`, macOS). UDP is not intercepted.
+- **REDIRECT-based; TCP only under the managed firewall.** Traffic is redirected to
+  the TProxy listener, and the original destination is recovered via
+  `SO_ORIGINAL_DST` (Linux) or a pf state-table lookup (`DIOCNATLOOK`, macOS).
+  With `firewall: false` + `udp: true`, Linux/IPv4 UDP TPROXY is an opt-in
+  (see below); otherwise UDP is not intercepted.
 - **Loop avoidance.** meow-rs's own outbound (the `DIRECT` adapter) is marked so the
   firewall skips it — on Linux via `SO_MARK` (`routing-mark`), on macOS via a UID bypass.
 - **Proxy-server bypass.** The IPs of your configured upstream proxy servers are
@@ -119,10 +121,29 @@ misses and connections drop after accept). Keep the `rdr` target equal to the
 `listen` address — see [tproxy-macos.md](https://github.com/meow-rs/meow-rs/blob/main/docs/tproxy-macos.md)
 for the full pf contract.
 
-Out of scope: `firewall: false` does **not** add an iptables backend, does not
-enable UDP or true Linux `TPROXY` (the listener remains TCP `REDIRECT`), and
-takes effect at startup only — a config change needs a restart. The shorthand
-`tproxy-port` always keeps the managed firewall.
+Out of scope: `firewall: false` does **not** add an iptables backend or change
+the TCP path (the listener remains TCP `REDIRECT`), and takes effect at
+startup only — a config change needs a restart. The shorthand `tproxy-port`
+always keeps the managed firewall.
+
+### UDP TPROXY (`udp: true`, Linux/IPv4 only)
+
+`firewall: false` is also the prerequisite for the opt-in UDP path (issue
+#564): a named listener with `udp: true` additionally binds a transparent UDP
+socket on the same port, recovers each datagram's original destination from
+`IP_ORIGDSTADDR`, routes it through the normal rules, and sends replies with
+the original destination as source address and port.
+
+Constraints: Linux + IPv4 only (`listen` must be a v4 address, not `'::'`);
+the deployer owns the `prerouting` TPROXY rules and fwmark→local-table policy
+routing (meow installs nothing for UDP); the recipe covers `prerouting`
+only — host-originated UDP needs an `output`-chain TPROXY setup of your
+own; `udp-timeout` (default
+60s) evicts idle flows and `max-connections` bounds flow count. Reply sockets
+bind the original destination verbatim — ports below 1024 additionally need
+`CAP_NET_BIND_SERVICE`, and reply sockets carry no `routing-mark`. See
+[docs/tproxy-gateway.md](https://github.com/meow-rs/meow-rs/blob/main/docs/tproxy-gateway.md)
+for the full external rule recipe.
 
 ## Host-only vs. LAN gateway
 

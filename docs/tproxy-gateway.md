@@ -38,9 +38,10 @@ Understand this before configuring — it explains every step below.
   passes through the `prerouting`/`forward` path, which meow's built-in table
   never hooks. **You must add those rules yourself** (this guide's `meow_gateway`
   table).
-- **No UDP.** QUIC (UDP/443) and other UDP from the LAN are not intercepted.
-  In practice you suppress QUIC at the DNS layer (see fake-ip below) so clients
-  fall back to TCP.
+- **UDP is off by default.** QUIC (UDP/443) and other UDP from the LAN are
+  not intercepted unless you opt in with `udp: true` (see below). In
+  practice you suppress QUIC at the DNS layer (see fake-ip below) so
+  clients fall back to TCP.
 
 ### Why the listener must NOT bind to loopback
 
@@ -109,6 +110,104 @@ management requires declaring the listener under `listeners:` as above.
 This is the mode to reach for when nftables is unavailable, when another
 privileged service (or iptables) owns redirect policy, or when you want custom
 output-chain behaviour the built-in table doesn't express.
+
+### `udp: true` — UDP TPROXY on the same port (Linux only)
+
+The named listener can additionally serve **UDP** via TPROXY on the same port
+(issue #564). Scope in this release:
+
+- **Linux only, IPv4 only.** `udp: true` on a non-Linux build, or on an
+  IPv6/dual-stack `listen` (e.g. `'::'`), is a startup/config error — bind
+  `0.0.0.0` or a specific v4 address instead.
+- **External firewall required.** `udp: true` must be combined with
+  `firewall: false`; meow never installs UDP TPROXY rules or policy routing —
+  the deployer owns all of it, and nothing is removed on exit.
+- **LAN forwarding only.** UDP TPROXY intercepts on the `prerouting` hook;
+  the host's *own* UDP traffic (`output`) is not captured — same restriction
+  as every TPROXY deployment.
+- UDP port 53 follows the normal routing rules — there is no implicit DNS
+  hijack. Point your rules at the meow DNS listener explicitly if you want
+  that.
+
+```yaml
+listeners:
+  - name: tproxy-gw
+    type: tproxy
+    listen: '0.0.0.0'    # IPv4 — NOT '::' when udp: true
+    port: 7893
+    firewall: false
+    udp: true
+    udp-timeout: 60      # per-flow idle timeout, seconds; 0 is an error
+```
+
+`max-connections` bounds live UDP flows for this listener too (`0` =
+unlimited). Per-flow queues are additionally bounded in datagram count and
+bytes, so a burst cannot pin unbounded memory; replies are written through a
+bounded transparent-socket cache (one FD per distinct original destination).
+
+Deployer-side steering for UDP (`tcp` stays on `redirect` in the output chain
+as in the steps below — TCP TPROXY is unchanged):
+
+```bash
+# fwmark → local delivery, the policy-routing half of TPROXY
+ip rule add fwmark 0x1 lookup 100
+ip route add local 0.0.0.0/0 dev lo table 100
+
+nft -f - <<'NFT'
+table ip meow_udp {
+  # Same bypass set as `meow_gateway` below — keep them in sync.
+  set reserved4 {
+    type ipv4_addr; flags interval;
+    elements = { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16,
+                 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 }
+  }
+  chain pre {
+    type filter hook prerouting priority mangle; policy accept;
+    iifname "eth0" fib daddr type local return        # gateway's own services (incl. DNS to LAN_IP)
+    iifname "eth0" udp dport 53 return                # let the nat-chain DNS hijack handle DNS
+    iifname "eth0" ip daddr @reserved4 return         # never proxy LAN/VPN-internal ranges
+    iifname "eth0" meta l4proto udp tproxy ip to 127.0.0.1:7893 meta mark set 0x1 accept
+  }
+}
+NFT
+```
+
+**The exemptions matter — a bare `meta l4proto udp` catch-all breaks your own
+gateway.** `prerouting` also sees packets destined to the gateway itself:
+without `fib daddr type local return`, a LAN client's DNS to `LAN_IP:53` gets
+TPROXY'd with `orig_dst = LAN_IP:53` and routed by meow to a destination where
+nothing listens. Ordering bites too: this chain runs at `priority mangle`
+(-150), *before* the `nat`/`dstnat` (-100) `meow_gateway` chain, so once a
+datagram is TPROXY'd the :53→:1053 DNAT hijack never sees it — `udp dport 53
+return` keeps forwarded DNS on the hijack path (clients pointed at `LAN_IP`
+are covered by the `fib local` rule instead). The `@reserved4` bypass mirrors
+the TCP chain's `meow_gateway` behaviour.
+
+**Scope the rule to your LAN interface** (`iifname "eth0"` above — substitute
+yours). Keep host-originated packets out of the TPROXY path: do not add a
+matching `output` rule for UDP. If the fwmark you pick collides with meow's
+`routing-mark`, meow's own outbound gets steered into the local table — keep
+the two mark values distinct.
+
+Replies are sent with the **original destination** as source address and port
+(via an `IP_TRANSPARENT` socket bound per destination on first use), so
+clients see responses as if they came from the real server. Two capability
+notes:
+
+- `IP_TRANSPARENT` needs `CAP_NET_ADMIN`/`CAP_NET_RAW` — a listener-socket
+  failure surfaces as a startup error, never a silent TCP-only degrade.
+- Reply sockets bind the original destination verbatim; for destinations
+  below port 1024 that bind additionally needs `CAP_NET_BIND_SERVICE`, which
+  `CAP_NET_ADMIN` does not imply. Reply sockets also do **not** carry
+  `routing-mark`/SO_MARK — mark-based policy rules must not steer reply
+  packets (whose source is the forged destination) toward the local table.
+- A `0.0.0.0`-bound listener conservatively drops any flow whose recovered
+  `orig_dst` shares the listener port (self-reinjection guard) — remote UDP
+  services on that same port number are unreachable through it. Bind a
+  specific address, or pick a listener port that doesn't collide.
+- The sniffer is TCP-only: UDP flows carry no recovered SNI, so under
+  redir-host they route by IP. Point LAN clients at fake-ip (or the snoop
+  table) if UDP domains matter.
 
 ---
 
@@ -350,6 +449,17 @@ systemctl enable --now meow meow-gateway
 `PartOf=meow.service` makes the gateway rules reload whenever meow restarts, so
 the two never drift.
 
+For a `udp: true` listener the same unit must also persist the policy-routing
+half — `nft -f` does not cover `ip rule`/`ip route … table 100`, so UDP would
+silently die on reboot without them:
+
+```ini
+ExecStart=/sbin/ip rule add fwmark 0x1 lookup 100
+ExecStart=/sbin/ip route add local 0.0.0.0/0 dev lo table 100
+ExecStop=/sbin/ip rule del fwmark 0x1 lookup 100
+ExecStop=/sbin/ip route del local 0.0.0.0/0 dev lo table 100
+```
+
 ---
 
 ## Step 4 — point clients at the gateway
@@ -396,9 +506,10 @@ rule — confirm the client's source IP appears:
 
 ## Limitations & troubleshooting
 
-- **No UDP/QUIC interception.** UDP/443 from the LAN is not proxied. fake-ip's
-  AAAA suppression nudges clients onto TCP; if needed, additionally `REJECT`
-  UDP/443 in `prerouting` to force the fallback.
+- **UDP needs `udp: true`.** Without it, UDP/443 from the LAN is not
+  proxied; fake-ip's AAAA suppression nudges clients onto TCP, and you can
+  additionally `REJECT` UDP/443 in `prerouting` to force the fallback. With
+  `udp: true` the scope notes above apply (Linux, IPv4, `prerouting` only).
 - **Connections refused / time out from clients, fine on the host.** The
   listener is bound to `127.0.0.1` — declare it via `listeners:` with a
   non-loopback `listen` (see [Step 1](#step-1--meow-config)).

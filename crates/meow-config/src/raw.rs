@@ -232,6 +232,11 @@ pub struct RawConfig {
     /// plausible mistake (`firewall:` belongs on a `listeners:` tproxy
     /// entry, issue #563).
     pub firewall: Option<serde_yaml::Value>,
+    /// No top-level `udp`/`udp-timeout` keys exist — captured only to
+    /// warn on the plausible mistake (`udp:` belongs on a `listeners:`
+    /// tproxy entry; `udp-timeout` on `listeners:`/`tun:`, issue #564).
+    pub udp: Option<serde_yaml::Value>,
+    pub udp_timeout: Option<serde_yaml::Value>,
 }
 
 /// A `hosts:` map value: one IP/domain alias or a list of IP addresses.
@@ -332,6 +337,12 @@ pub struct RawListener {
     /// an external system — no nft/pfctl invocation, no bypass-IP
     /// collection, no cleanup on exit (issue #563).
     pub firewall: Option<bool>,
+    /// `tproxy` listeners only: UDP flow idle timeout in seconds
+    /// (default 60, issue #564). `0` is a config error. The companion `udp`
+    /// key itself lives in the shadowsocks field block below — one raw key,
+    /// two consumers: for tproxy `udp` defaults to `false` and requires
+    /// `firewall: false` (meow does not manage UDP gateway rules).
+    pub udp_timeout: Option<u64>,
     /// Per-listener override of the global `max-connections` cap. `0`
     /// disables the cap for this listener.
     pub max_connections: Option<usize>,

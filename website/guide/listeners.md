@@ -47,11 +47,13 @@ listeners:
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
 | `name` | string | ✓ | — | Unique; appears in logs, the API, and `IN-NAME` rules |
-| `type` | string | ✓ | — | `mixed` · `http` · `socks5` · `tproxy` |
+| `type` | string | ✓ | — | `mixed` · `http` · `socks5` · `tproxy` · `shadowsocks` |
 | `port` | u16 | | — | Unique across listeners; omit or `0` to let the OS assign an ephemeral port |
 | `listen` | string | | per type | Bind IP literal, or `host:port` (e.g. `127.0.0.1:0`) |
 | `tproxy-sni` | bool | | global | (tproxy) deprecated SNI shorthand — prefer [`sniffer`](./sniffer) |
 | `firewall` | bool | | `true` | (tproxy) `false` = external firewall management — no nft/pfctl calls, no cleanup; see [Transparent Proxy](./transparent-proxy) |
+| `udp` | bool | | `false` | (tproxy, Linux/IPv4 only) UDP TPROXY on the same port; requires `firewall: false`; see [Transparent Proxy](./transparent-proxy) |
+| `udp-timeout` | secs | | `60` | (tproxy) UDP flow idle timeout; `0` is an error |
 | `max-connections` | usize | | global | Per-listener concurrency cap; `0` = unlimited |
 
 `listen` defaults to `127.0.0.1` for `tproxy` and to the global `bind-address` otherwise.
@@ -84,6 +86,8 @@ own OS-assigned port.
 - **`http`** — HTTP CONNECT proxy.
 - **`socks5`** — SOCKS5 proxy; supports inbound auth.
 - **`tproxy`** — firewall transparent proxy (Linux / experimental macOS); see [Transparent Proxy](./transparent-proxy).
+- **`shadowsocks`** — Shadowsocks server inbound; its `udp` field gates the
+  SS UDP relay (default `true`) and is unrelated to tproxy's `udp`.
 - **`tun:`** (top-level, not in this array) — L3 TUN inbound. On Windows this is a
   Wintun adapter and is the transparent-proxy path. See [Transparent Proxy](./transparent-proxy).
 
