@@ -80,6 +80,7 @@ struct Fixture {
     raw_config: Arc<RwLock<RawConfig>>,
     config_path: String,
     proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>>,
+    provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
 }
 
 /// Shared scaffolding: a two-node file provider `prov` and an origin
@@ -131,17 +132,21 @@ async fn fixture_at(sub_addr: std::net::SocketAddr) -> Fixture {
     ))
     .unwrap();
 
-    // The shared provider registry, populated the same way startup does.
+    // The shared provider-dialer registry, populated the same way
+    // startup does (`Config::provider_dialer_registry`, not the per-build
+    // generation cell `RebuildResult::dialer_registry`).
     // `ipv6` must match what the rebuild computes (`effective_ipv6` of the
     // fixture YAML = false): a mismatch makes `matches_def` reject the
     // live provider, and the commit would wire a fresh empty slot that a
     // detached refresh fills asynchronously — a race, not a test.
+    let provider_dialer_registry = meow_proxy::dialer::ProxyRegistry::default();
     let proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>> = Arc::new(
         load_proxy_providers(
             raw.proxy_providers.as_ref().unwrap(),
             Some(dir.path()),
             false,
             false,
+            &provider_dialer_registry,
         )
         .await
         .unwrap()
@@ -179,6 +184,7 @@ async fn fixture_at(sub_addr: std::net::SocketAddr) -> Fixture {
         raw_config: Arc::new(RwLock::new(raw)),
         config_path: config_path.to_string_lossy().into_owned(),
         proxy_providers,
+        provider_dialer_registry,
         dir,
     }
 }
@@ -191,6 +197,7 @@ fn spawn_loop(fx: &Fixture) {
         Arc::new(RwLock::new(None)),
         Arc::new(RwLock::new(HashMap::new())),
         Arc::clone(&fx.proxy_providers),
+        fx.provider_dialer_registry.clone(),
         Arc::new(RefreshSupervisor::default()),
     ));
 }

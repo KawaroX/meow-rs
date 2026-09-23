@@ -36,7 +36,10 @@ pub struct RouteTable {
     pub rules: Arc<Vec<Box<dyn Rule>>>,
     pub domain_index: Arc<DomainIndex>,
     pub compiled_rules: Arc<CompiledRuleSet>,
-    pub proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
+    /// Shared so routing installs can republish the map into the
+    /// provider-node dialer registry (`publish_dialer_registry`) with an
+    /// Arc bump instead of a full map clone (issue #489 review).
+    pub proxies: Arc<HashMap<SmolStr, Arc<dyn Proxy>>>,
     /// The registry generation `proxies` was published into. Retained so the
     /// `dialer-proxy` front-hop lookups the map's adapters perform keep
     /// resolving for exactly as long as this route table lives — the adapters
@@ -57,7 +60,7 @@ impl RouteTable {
             rules: Arc::new(rules),
             domain_index: Arc::new(domain_index),
             compiled_rules: Arc::new(compiled_rules),
-            proxies,
+            proxies: Arc::new(proxies),
             dialer_registry,
         }
     }
@@ -67,7 +70,7 @@ impl RouteTable {
             rules: Arc::new(Vec::new()),
             domain_index: Arc::new(DomainIndex::empty()),
             compiled_rules: Arc::new(CompiledRuleSet::empty()),
-            proxies: HashMap::new(),
+            proxies: Arc::new(HashMap::new()),
             dialer_registry: meow_proxy::dialer::ProxyRegistry::default(),
         }
     }
@@ -115,6 +118,12 @@ pub struct TunnelInner {
     /// config commit so checks appear/disappear/respawn with the config
     /// (issue #514).
     pub health_checks: Mutex<crate::health_check::HealthCheckSupervisor>,
+    /// Registry that provider-sourced nodes' `dialer-proxy` targets resolve
+    /// against (issue #489). Installed once at startup from `Config` (which
+    /// shares the same handle into every `ProxyProvider`); every routing
+    /// install republishes the live proxies map into it so provider nodes —
+    /// which persist across config rebuilds — always resolve current names.
+    dialer_registry: std::sync::OnceLock<meow_proxy::dialer::ProxyRegistry>,
 }
 
 /// A running TUN listener: the task plus the signal resolving once its
@@ -547,12 +556,37 @@ impl Tunnel {
                 needs_ip_resolution: AtomicBool::new(false),
                 needs_process_lookup: AtomicBool::new(false),
                 tun_handle: RwLock::new(None),
+                dialer_registry: std::sync::OnceLock::new(),
             }),
         }
     }
 
     pub fn inner(&self) -> &Arc<TunnelInner> {
         &self.inner
+    }
+
+    /// Install the registry provider-sourced nodes resolve `dialer-proxy`
+    /// names against (issue #489). Called once at startup with the handle
+    /// `load_config` shared into every `ProxyProvider`; subsequent calls are
+    /// ignored — the registry is a process-lifetime singleton by contract.
+    pub fn set_dialer_registry(&self, registry: meow_proxy::dialer::ProxyRegistry) {
+        if self.inner.dialer_registry.set(registry).is_err() {
+            warn!(
+                "dialer registry already installed — the new handle will never \
+                 be published; provider-sourced `dialer-proxy` nodes built on \
+                 it will fail every dial"
+            );
+        }
+    }
+
+    /// Republish the live proxies map into the provider-node dialer
+    /// registry, if one was installed (issue #489). Runs on every routing
+    /// install so provider-sourced `dialer-proxy` targets resolve the current
+    /// route map rather than a frozen startup-era snapshot.
+    fn publish_dialer_registry(&self, route: &RouteTable) {
+        if let Some(registry) = self.inner.dialer_registry.get() {
+            registry.publish(std::sync::Arc::clone(&route.proxies));
+        }
     }
 
     /// Weak handle to the inner state — long-lived background loops
@@ -598,11 +632,10 @@ impl Tunnel {
                 rules: Arc::new(rules),
                 domain_index: Arc::new(new_index),
                 compiled_rules: Arc::new(compiled_rules),
-                proxies: route.proxies.clone(),
-                // The proxies map is unchanged, so the generation's chained
-                // adapters must keep resolving through the same registry cell.
+                proxies: Arc::clone(&route.proxies),
                 dialer_registry: route.dialer_registry.clone(),
             };
+            self.publish_dialer_registry(&new_route);
             std::mem::replace(&mut *route, Arc::new(new_route))
         };
         // The superseded table's destructor cascade (rules, adapters,
@@ -652,9 +685,10 @@ impl Tunnel {
                 rules: Arc::clone(&route.rules),
                 domain_index: Arc::clone(&route.domain_index),
                 compiled_rules: Arc::clone(&route.compiled_rules),
-                proxies,
+                proxies: Arc::new(proxies),
                 dialer_registry,
             };
+            self.publish_dialer_registry(&new_route);
             std::mem::replace(&mut *route, Arc::new(new_route))
         };
         // Same drop-outside-lock rule as `update_rules` — the old table's
@@ -716,7 +750,12 @@ impl Tunnel {
     fn install_routing(&self, route: Arc<RouteTable>) -> Arc<RouteTable> {
         let needs_ip = route.compiled_rules.needs_ip_resolution();
         let needs_process = route.compiled_rules.needs_process_lookup();
+        // Publish inside the write hold so registry and route table swap
+        // linearly — a concurrent installer can otherwise leave the registry
+        // naming proxies the live route map already dropped (issue #489
+        // review), matching the partial updaters above.
         let mut current = self.inner.route.write();
+        self.publish_dialer_registry(&route);
         self.inner
             .needs_ip_resolution
             .store(needs_ip, Ordering::Relaxed);
@@ -1163,6 +1202,77 @@ mod tests {
         assert_eq!(tunnel.statistics().snapshot(), (123, 456));
     }
 
+    /// Every routing install must republish the proxies map into the
+    /// dialer registry provider-sourced `dialer-proxy` targets resolve
+    /// against — including the partial `update_proxies`/`update_rules`
+    /// paths, not just wholesale `update_routing` (issue #489).
+    #[test]
+    fn routing_installs_republish_dialer_registry() {
+        let tunnel = test_tunnel();
+        let registry = meow_proxy::dialer::ProxyRegistry::default();
+        tunnel.set_dialer_registry(registry.clone());
+        let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+        let mut built = res.proxies;
+        let direct = built.remove("DIRECT").unwrap();
+        let build_registry = res.dialer_registry;
+
+        tunnel.update_routing(
+            HashMap::from([("DIRECT".into(), Arc::clone(&direct))]),
+            vec![],
+            build_registry.clone(),
+        );
+        assert!(
+            meow_proxy::dialer::DialerTarget::new("DIRECT", &registry)
+                .resolve()
+                .is_some(),
+            "update_routing must publish the proxies map"
+        );
+
+        tunnel.update_proxies(
+            HashMap::from([("RENAMED".into(), Arc::clone(&direct))]),
+            build_registry.clone(),
+        );
+        assert!(
+            meow_proxy::dialer::DialerTarget::new("RENAMED", &registry)
+                .resolve()
+                .is_some(),
+            "update_proxies must republish"
+        );
+        // Publish is a wholesale replace: a name absent from the new map must
+        // stop resolving, not linger as a merge leftover.
+        assert!(
+            meow_proxy::dialer::DialerTarget::new("DIRECT", &registry)
+                .resolve()
+                .is_none(),
+            "a removed name must stop resolving after republish"
+        );
+
+        // Discriminating check: clobber the registry with a foreign map
+        // first — `update_rules` must actively republish, not merely leave
+        // the previous publish untouched.
+        registry.publish(std::sync::Arc::new(HashMap::new()));
+        tunnel.update_rules(vec![]);
+        assert!(
+            meow_proxy::dialer::DialerTarget::new("RENAMED", &registry)
+                .resolve()
+                .is_some(),
+            "update_rules must republish the proxies map, not leave a foreign map"
+        );
+
+        tunnel.reload_routing(
+            HashMap::from([("RELOADED".into(), Arc::clone(&direct))]),
+            vec![],
+            None,
+            build_registry,
+        );
+        assert!(
+            meow_proxy::dialer::DialerTarget::new("RELOADED", &registry)
+                .resolve()
+                .is_some(),
+            "reload_routing must republish through install_routing"
+        );
+    }
+
     /// Issue #533: the built-in proxies map registers PASS / PASS-RULE /
     /// COMPATIBLE, and a rule targeting PASS skips silently to the next
     /// rule — upstream `continue GetRules` in `match()`.
@@ -1315,5 +1425,144 @@ mod tests {
                 .any(|((_, action), n)| *action == "DIRECT" && *n == 1),
             "COMPATIBLE match must bucket as DIRECT, got: {stats:?}"
         );
+    }
+
+    /// Front-hop mock for the provider-dialer e2e: records every
+    /// `dial_tcp`'s metadata and refuses the connection — observing the
+    /// dial proves the provider node's `dialer-proxy` chain resolved.
+    struct RecordingFront {
+        seen: std::sync::Mutex<Vec<Metadata>>,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for RecordingFront {
+        fn name(&self) -> &str {
+            "front"
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Socks5
+        }
+        fn addr(&self) -> &str {
+            "127.0.0.1:1080"
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(
+            &self,
+            metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            self.seen.lock().unwrap().push(metadata.clone());
+            Err(meow_common::MeowError::NotSupported(
+                "recording front refuses connections".to_string(),
+            ))
+        }
+        async fn dial_udp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            unimplemented!("test mock has no UDP")
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            static H: std::sync::OnceLock<meow_common::ProxyHealth> = std::sync::OnceLock::new();
+            H.get_or_init(meow_common::ProxyHealth::new)
+        }
+    }
+
+    impl Proxy for RecordingFront {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// Issue #489 end-to-end: a provider node's `dialer-proxy` must resolve
+    /// through the *same* registry cell the tunnel republishes — the one
+    /// `set_dialer_registry` installs. Any break in the
+    /// `load_proxy_providers → Config::provider_dialer_registry →
+    /// set_dialer_registry → update_routing` chain leaves the provider
+    /// node's dialer pointing at a dead cell and the dial fails closed
+    /// without ever reaching `front`.
+    #[tokio::test]
+    async fn provider_dialer_proxy_dials_through_published_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - {name: n1, type: socks5, server: 127.0.0.1, \
+             port: 1, dialer-proxy: front}\n",
+        )
+        .unwrap();
+
+        let provider_registry = meow_proxy::dialer::ProxyRegistry::default();
+        let raw: meow_config::raw::RawConfig = serde_yaml::from_str(
+            "proxy-providers:\n  prov:\n    type: file\n    path: nodes.yaml\n",
+        )
+        .unwrap();
+        let providers = meow_config::proxy_provider::load_proxy_providers(
+            raw.proxy_providers.as_ref().unwrap(),
+            Some(dir.path()),
+            false,
+            false,
+            &provider_registry,
+        )
+        .await
+        .unwrap();
+        let provider = Arc::clone(&providers["prov"]);
+        assert_eq!(provider.proxies().len(), 1, "file provider must load n1");
+
+        // A group over the provider slot puts the provider node into the
+        // route map's reachable set, exactly like `use: [prov]` does.
+        let front = Arc::new(RecordingFront {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let group: Arc<dyn Proxy> = Arc::new(meow_proxy::SelectorGroup::new_with_providers(
+            "g",
+            vec![],
+            vec![Arc::clone(&provider.slot)],
+        ));
+
+        let tunnel = test_tunnel();
+        tunnel.set_dialer_registry(provider_registry.clone());
+        tunnel.update_routing(
+            HashMap::from([
+                ("front".into(), Arc::clone(&front) as Arc<dyn Proxy>),
+                ("g".into(), group),
+            ]),
+            vec![Box::new(meow_rules::final_rule::FinalRule::new("g"))],
+            Default::default(),
+        );
+
+        let meta = Metadata {
+            host: "example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
+        assert_eq!(adapter.name(), "g");
+        // The group selects n1, whose socks5 adapter dials 127.0.0.1:1
+        // through the injected `front` hop; the front records the dial and
+        // refuses, so the observable signal is the recorded metadata.
+        adapter
+            .dial_tcp(&meta)
+            .await
+            .err()
+            .expect("the recording front refuses");
+        let seen = front.seen.lock().unwrap();
+        let [dial] = seen.as_slice() else {
+            panic!("the provider node's chained dial must reach the front hop: {seen:?}")
+        };
+        assert_eq!(dial.dst_ip, Some("127.0.0.1".parse().unwrap()));
+        assert_eq!(dial.dst_port, 1);
     }
 }

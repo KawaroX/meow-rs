@@ -81,10 +81,18 @@ pub struct ApiServer {
     /// Shared handle the embedder fills once the standalone DNS server is
     /// spawned; `PUT /configs` rebinds or hot-swaps it (issue #514).
     dns_server: Arc<RwLock<Option<routes::DnsServerHandle>>>,
+    /// Provider-dialer cell `PUT /configs` rebuilds hand to newly declared
+    /// providers (issue #489).
+    provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
 }
 
 impl ApiServer {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "startup wiring funnel: every arg is an independently owned \
+                  runtime handle assembled in main; bundling them into a \
+                  params struct would only rename the same arity"
+    )]
     pub fn new(
         tunnel: Tunnel,
         listen_addr: SocketAddr,
@@ -98,6 +106,7 @@ impl ApiServer {
         listeners: Vec<NamedListener>,
         external_ui: Option<PathBuf>,
         dns_server: Arc<RwLock<Option<routes::DnsServerHandle>>>,
+        provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
     ) -> Self {
         Self {
             tunnel,
@@ -112,6 +121,7 @@ impl ApiServer {
             listeners,
             external_ui,
             dns_server,
+            provider_dialer_registry,
         }
     }
 
@@ -129,6 +139,7 @@ impl ApiServer {
             external_ui: self.resolve_external_ui(),
             traffic_feed: Default::default(),
             dns_server: Arc::clone(&self.dns_server),
+            provider_dialer_registry: self.provider_dialer_registry.clone(),
         });
 
         let app = routes::create_router(state);
