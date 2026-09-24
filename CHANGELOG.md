@@ -302,6 +302,10 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **DNS forwarding preserves upstream error responses for non-address queries** —
+  TXT, MX, HTTPS, and other non-A/AAAA queries retain the upstream response code
+  instead of reporting `NOERROR` for `NXDOMAIN`, `SERVFAIL`, or `REFUSED` replies.
+
 - **A non-ECH mid-handshake TLS failure no longer corrupts ECH state**
   (#572). `SSL_get0_ech_retry_configs` is only legal after an
   authenticated `SSL_R_ECH_REJECTED`, but the self-heal path read it on
