@@ -24,11 +24,44 @@ use tracing::{debug, info, warn};
 /// `Arc<Statistics>` (via `TunnelInner.stats`) that outlives the guard.
 pub struct ConnectionGuard<'a> {
     stats: &'a Statistics,
-    id: uuid::Uuid,
+    key: ConnectionKey,
     counters: Arc<crate::statistics::ConnCounters>,
 }
 
+#[derive(Clone, Copy)]
+enum ConnectionKey {
+    Api(uuid::Uuid),
+    Headless(usize),
+}
+
 impl<'a> ConnectionGuard<'a> {
+    fn track_named(
+        stats: &'a Statistics,
+        metadata: &Metadata,
+        rule: SmolStr,
+        rule_payload: SmolStr,
+        proxy_name: &str,
+    ) -> Self {
+        if let Some((id, counters)) = stats.begin_headless_connection() {
+            return Self {
+                stats,
+                key: ConnectionKey::Headless(id),
+                counters,
+            };
+        }
+        let (id, counters) = stats.track_connection_with_counters(
+            metadata.pure(),
+            rule,
+            rule_payload,
+            smallvec![Arc::from(proxy_name)],
+        );
+        Self {
+            stats,
+            key: ConnectionKey::Api(id),
+            counters,
+        }
+    }
+
     pub fn track(
         stats: &'a Statistics,
         metadata: Metadata,
@@ -38,11 +71,16 @@ impl<'a> ConnectionGuard<'a> {
     ) -> Self {
         // Obtain the handle before publishing the entry. A concurrent DELETE
         // must cancel this exact handle, even before its first poll.
-        let (id, counters) =
-            stats.track_connection_with_counters(metadata, rule, rule_payload, chains);
+        let (key, counters) = if let Some((id, counters)) = stats.begin_headless_connection() {
+            (ConnectionKey::Headless(id), counters)
+        } else {
+            let (id, counters) =
+                stats.track_connection_with_counters(metadata, rule, rule_payload, chains);
+            (ConnectionKey::Api(id), counters)
+        };
         Self {
             stats,
-            id,
+            key,
             counters,
         }
     }
@@ -58,8 +96,13 @@ impl<'a> ConnectionGuard<'a> {
         }
     }
 
+    /// API-visible ID for a fully tracked connection. Headless connections
+    /// deliberately have no UUID and must not be exposed through the API.
     pub fn id(&self) -> uuid::Uuid {
-        self.id
+        match self.key {
+            ConnectionKey::Api(id) => id,
+            ConnectionKey::Headless(_) => panic!("headless connections have no API ID"),
+        }
     }
 
     /// Live byte counters shared with the statistics table. Clone the `Arc`
@@ -71,7 +114,10 @@ impl<'a> ConnectionGuard<'a> {
 
 impl Drop for ConnectionGuard<'_> {
     fn drop(&mut self) {
-        self.stats.close_connection(self.id);
+        match self.key {
+            ConnectionKey::Api(id) => self.stats.close_connection(id),
+            ConnectionKey::Headless(id) => self.stats.close_headless_connection(id),
+        }
     }
 }
 
@@ -95,6 +141,31 @@ impl TunnelInner {
 }
 
 impl<'a> TcpAdmission<'a> {
+    /// Register a routed connection without constructing API-only metadata
+    /// when the application has no external controller.
+    pub fn track_named(
+        self,
+        metadata: &Metadata,
+        rule: SmolStr,
+        rule_payload: SmolStr,
+        proxy_name: &str,
+    ) -> Option<ConnectionGuard<'a>> {
+        let generation = self.inner.tcp_generation.read();
+        if *generation != self.generation {
+            debug!("TCP routing setup invalidated by cold reload");
+            return None;
+        }
+        let guard = ConnectionGuard::track_named(
+            &self.inner.stats,
+            metadata,
+            rule,
+            rule_payload,
+            proxy_name,
+        );
+        drop(generation);
+        Some(guard)
+    }
+
     /// Register only if no cold reload has crossed this routing decision.
     /// The read lock covers both validation and insertion: a reload cannot
     /// close the table between these operations and leave an old flow alive.
@@ -221,14 +292,9 @@ pub async fn route_inbound_tcp<C>(
 
     // Track the connection — guard drops it on every exit path, including
     // the abort case where the manual close call below would never run.
-    // `rule_name` / `rule_payload` are moved in (already `SmolStr`); the
-    // chains vec carries one `Arc<str>` for the proxy name.
-    let Some(guard) = admission.track(
-        metadata.pure(),
-        rule_name,
-        rule_payload,
-        smallvec![Arc::from(proxy.name())],
-    ) else {
+    // API-only metadata and proxy-name ownership are built only when needed.
+    let Some(guard) = admission.track_named(&metadata, rule_name, rule_payload, proxy.name())
+    else {
         return;
     };
 
@@ -381,6 +447,34 @@ mod tests {
             .unwrap();
         assert_eq!(fresh.run_until_closed(async { "dial" }).await, Some("dial"));
         assert_eq!(inner.stats.active_connection_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn headless_connections_skip_api_details_but_cold_reload_cancels_them() {
+        let tunnel = test_tunnel();
+        tunnel.statistics().set_headless();
+        let inner = tunnel.inner();
+        let guard = inner
+            .tcp_admission()
+            .track_named(&metadata(), "MATCH".into(), "".into(), "DIRECT")
+            .unwrap();
+
+        assert_eq!(tunnel.statistics().active_connection_count(), 0);
+        tunnel.statistics().record_upload(guard.counters(), 123);
+        assert_eq!(tunnel.statistics().snapshot(), (123, 0));
+
+        assert_eq!(
+            tunnel.reload_routing(Default::default(), vec![], None, Default::default()),
+            1
+        );
+        assert!(guard
+            .run_until_closed(async { panic!("closed headless flow started dialing") })
+            .await
+            .is_none());
+        assert_eq!(
+            tunnel.reload_routing(Default::default(), vec![], None, Default::default()),
+            0
+        );
     }
 
     #[tokio::test]

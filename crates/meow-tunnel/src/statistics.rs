@@ -23,8 +23,8 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use smallvec::SmallVec;
 use smol_str::SmolStr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
 
 /// Hot-path rule-match counters. Keys are `&'static str` to avoid per-call
@@ -165,6 +165,10 @@ pub struct Statistics {
     /// 36-byte hyphenated representation per insert.  REST handlers parse the
     /// query path back into a `Uuid` at lookup time.
     pub connections: DashMap<Uuid, ConnectionInfo>,
+    /// Headless flows still need cancellation on a cold config reload, but
+    /// never need the metadata and serialization fields used by the API.
+    headless_connections: OnceLock<DashMap<usize, Arc<ConnCounters>>>,
+    next_headless_id: AtomicUsize,
     pub rule_match: Arc<RuleMatchCounters>,
 }
 
@@ -175,6 +179,8 @@ impl Statistics {
             download_total: AtomicI::new(0),
             traffic: Mutex::new(TrafficSnapshot::default()),
             connections: DashMap::new(),
+            headless_connections: OnceLock::new(),
+            next_headless_id: AtomicUsize::new(0),
             rule_match: Arc::new(RuleMatchCounters::new()),
         }
     }
@@ -275,6 +281,34 @@ impl Statistics {
         (uuid, counters)
     }
 
+    /// Select the lighter connection registry before listeners start. The
+    /// default remains full tracking for embedders and API consumers.
+    pub fn set_headless(&self) {
+        assert!(self.connections.is_empty());
+        assert!(self.headless_connections.set(DashMap::new()).is_ok());
+    }
+
+    pub(crate) fn begin_headless_connection(&self) -> Option<(usize, Arc<ConnCounters>)> {
+        let connections = self.headless_connections.get()?;
+        let id = self
+            .next_headless_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("headless connection ID exhausted");
+        let counters = Arc::new(ConnCounters::default());
+        connections.insert(id, Arc::clone(&counters));
+        Some((id, counters))
+    }
+
+    pub(crate) fn close_headless_connection(&self, id: usize) {
+        if let Some((_, counters)) = self
+            .headless_connections
+            .get()
+            .and_then(|connections| connections.remove(&id))
+        {
+            counters.close();
+        }
+    }
+
     /// Signal the owner to drop its dial/relay future and remove the entry.
     pub fn close_connection(&self, id: Uuid) {
         if let Some((_, info)) = self.connections.remove(&id) {
@@ -326,6 +360,13 @@ impl Statistics {
             closed += 1;
             false
         });
+        if let Some(connections) = self.headless_connections.get() {
+            connections.retain(|_, counters| {
+                counters.close();
+                closed += 1;
+                false
+            });
+        }
         closed
     }
 }
