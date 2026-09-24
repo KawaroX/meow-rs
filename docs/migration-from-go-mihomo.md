@@ -307,8 +307,9 @@ sweeps static members of every group type since v1.18.4).
 ### load-balance
 
 Supported in M1.C-1. Two strategies: `round-robin` (default) and
-`consistent-hashing` (sticky by source IP). Periodic health-check using the
-same URL-probe mechanism as `url-test`.
+`consistent-hashing` (sticky by destination — mihomo `getKey`: IP-literal
+host verbatim, domain reduced to eTLD+1, else `dst_ip`). Periodic
+health-check using the same URL-probe mechanism as `url-test`.
 
 ```yaml
 proxy-groups:
@@ -331,13 +332,14 @@ proxy-groups:
 | Unknown `strategy` value | Falls back to round-robin silently | Hard parse error — wrong strategy means wrong distribution (ADR-0002 Class A). |
 | All proxies dead | Returns a dead proxy slot; dial fails | Returns `NoProxyAvailable` immediately — fast, named failure (Class B). |
 | `consistent-hashing` with no alive proxies | Panics (index out of bounds) | Returns `NoProxyAvailable` cleanly (Class A). |
-| `consistent-hashing` key + hash | Destination key (`getKey`: IP-literal host → host, domain → eTLD+1) hashed with `utils.MapHash` + `jumpHash` over the **full** member list, retrying dead members up to 5× — minimal reshuffle on membership changes | Client `src_ip` bytes hashed with FNV-1a `% alive_count` over the **alive** subset — "same client → same node"; membership changes reshuffle most assignments (Class B). |
+| `consistent-hashing` hash seed | `utils.MapHash` is process-seeded — assignments reshuffle on every restart | Same destination key (`getKey`: IP-literal host → host, domain → eTLD+1, else `dst_ip`) + `jumpHash` over the **full** member list with dead-member retry — but hashed with a fixed FNV-1a-64, so assignments are stable across restarts (Class B, strictly better for stability). |
 
-**Note on "consistent-hashing":** despite the name, meow's variant is a
-modulo-hash keyed by *client source IP* — stable for a given client given
-a fixed alive list, but a membership change reshuffles most assignments.
-Upstream's is a jump-hash keyed by *destination* over the full member
-list. See `docs/specs/group-load-balance.md` divergence row 4.
+**Note on "consistent-hashing":** since #621 the key and hash shape match
+upstream — destination-keyed `jump_hash` over the full member list, not a
+client-IP modulo hash. The remaining difference is the seed: upstream's
+`maphash` is seeded per process (assignments are not even reproducible
+upstream across restarts); ours is fixed FNV-1a-64. See
+`docs/specs/group-load-balance.md` divergence row 4.
 
 ### relay
 
@@ -632,8 +634,8 @@ Most common format from public providers. Typical issues:
    `listeners:` tproxy entry and defaults **on** (managed nftables/pf table),
    and the `tproxy-port` shorthand is always managed. A config that ran
    externally-managed rules upstream must set `firewall: false` explicitly on
-   the listener, or meow will install its own `inet meow_tproxy` / pf anchor
-   alongside yours. A stray top-level `firewall:` key warns and is ignored —
+   the listener, or meow will install its own `inet meow_tproxy_<pid>_<seq>` /
+   `com.apple/com.meow.tproxy.<pid>.<seq>` pf anchor alongside yours. A stray top-level `firewall:` key warns and is ignored —
    it is not the upstream top-level `iptables:` equivalent; the upstream
    `iptables:` block itself (`enable`/`inbound-interface`/`bypass`/
    `dns-redirect`) is likewise ignored.
