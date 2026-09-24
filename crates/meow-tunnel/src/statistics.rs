@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use smallvec::SmallVec;
 use smol_str::SmolStr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
 
@@ -168,7 +168,6 @@ pub struct Statistics {
     /// Headless flows still need cancellation on a cold config reload, but
     /// never need the metadata and serialization fields used by the API.
     headless_connections: OnceLock<DashMap<usize, Arc<ConnCounters>>>,
-    next_headless_id: AtomicUsize,
     pub rule_match: Arc<RuleMatchCounters>,
 }
 
@@ -180,7 +179,6 @@ impl Statistics {
             traffic: Mutex::new(TrafficSnapshot::default()),
             connections: DashMap::new(),
             headless_connections: OnceLock::new(),
-            next_headless_id: AtomicUsize::new(0),
             rule_match: Arc::new(RuleMatchCounters::new()),
         }
     }
@@ -288,22 +286,24 @@ impl Statistics {
         assert!(self.headless_connections.set(DashMap::new()).is_ok());
     }
 
-    pub(crate) fn begin_headless_connection(&self) -> Option<(usize, Arc<ConnCounters>)> {
+    pub(crate) fn begin_headless_connection(&self) -> Option<Arc<ConnCounters>> {
         let connections = self.headless_connections.get()?;
-        let id = self
-            .next_headless_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .expect("headless connection ID exhausted");
         let counters = Arc::new(ConnCounters::default());
-        connections.insert(id, Arc::clone(&counters));
-        Some((id, counters))
+        // The guard pins this allocation until after its Drop unregisters it.
+        // Even after a reload drains the map, a stale guard keeps its address
+        // from being reused by a new connection. The address is only a private
+        // map key, never dereferenced, and has no cumulative ID limit on 32-bit.
+        connections.insert(Arc::as_ptr(&counters).addr(), Arc::clone(&counters));
+        Some(counters)
     }
 
-    pub(crate) fn close_headless_connection(&self, id: usize) {
+    pub(crate) fn close_headless_connection(&self, counters: &Arc<ConnCounters>) {
+        // Borrow the owning Arc so the key cannot outlive its allocation.
+        let key = Arc::as_ptr(counters).addr();
         if let Some((_, counters)) = self
             .headless_connections
             .get()
-            .and_then(|connections| connections.remove(&id))
+            .and_then(|connections| connections.remove(&key))
         {
             counters.close();
         }
@@ -327,6 +327,8 @@ impl Statistics {
         )
     }
 
+    /// Number of API-tracked connections. Headless cancellation handles are
+    /// excluded, so this can return zero while headless TCP flows are live.
     pub fn active_connection_count(&self) -> usize {
         self.connections.len()
     }
