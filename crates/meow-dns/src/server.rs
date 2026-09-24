@@ -1216,6 +1216,13 @@ mod tests {
     }
 
     async fn resolver_with_upstream_rcode(code: ResponseCode) -> crate::resolver::Resolver {
+        resolver_with_upstream_response(code, None).await
+    }
+
+    async fn resolver_with_upstream_response(
+        code: ResponseCode,
+        answer: Option<Record>,
+    ) -> crate::resolver::Resolver {
         let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = upstream.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1226,6 +1233,9 @@ mod tests {
                 Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
             response.metadata.response_code = code;
             response.add_queries(request.queries.iter().cloned());
+            if let Some(answer) = answer {
+                response.add_answer(answer);
+            }
             upstream
                 .send_to(&response.to_bytes().unwrap(), peer)
                 .await
@@ -1331,6 +1341,29 @@ mod tests {
                 assert!(response.answers.is_empty());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_preserves_txt_answer() {
+        use hickory_proto::rr::rdata::TXT;
+        use hickory_proto::rr::{Name, RData};
+
+        let answer = Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            123,
+            RData::TXT(TXT::new(vec!["forwarded TXT answer".to_string()])),
+        );
+        let resolver =
+            resolver_with_upstream_response(ResponseCode::NoError, Some(answer.clone())).await;
+        let query = sample_query(7, u16::from(RecordType::TXT));
+        let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(response.answers[0], answer);
+        // Record equality ignores TTL.
+        assert_eq!(response.answers[0].ttl, answer.ttl);
     }
 
     #[tokio::test]
