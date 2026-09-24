@@ -365,8 +365,7 @@ impl CompiledRuleSet {
                 .unwrap_or(RuleOp::Fallback);
 
             // Constant-false pruning: drop rules that can never match, so
-            // they neither occupy scan slots nor force metadata enrichment
-            // (a dead GEOSITE rule must not force DNS pre-resolution).
+            // they neither occupy scan slots nor force metadata enrichment.
             if rule.never_matches() {
                 pruned_never_match += 1;
                 continue;
@@ -375,9 +374,9 @@ impl CompiledRuleSet {
             // Constant folding: logic trees simplify (never-match children
             // erase OR arms and kill AND trees, double negation cancels).
             // A tree folding to `Never` joins the constant-false prune —
-            // dropping its metadata demands with it, same as a dead GEOSITE
-            // — and a tree folding to `Always` becomes an unconditional
-            // MATCH terminator for the dead-rule pass below.
+            // dropping its metadata demands with it — and a tree folding
+            // to `Always` becomes an unconditional MATCH terminator for
+            // the dead-rule pass below.
             let op = match fold_op(op) {
                 Folded::Never => {
                     pruned_never_match += 1;
@@ -3418,7 +3417,6 @@ mod tests {
                 "nonexistent",
                 "Direct",
                 Some(Arc::new(db)),
-                false,
             )),
             Box::new(FinalRule::new("DIRECT")),
         ];
@@ -3427,6 +3425,71 @@ mod tests {
 
         assert_eq!(set.len(), 1, "unknown geosite category must be pruned");
         assert!(!set.needs_ip_resolution());
+    }
+
+    #[test]
+    fn geosite_live_category_does_not_demand_ip_resolution() {
+        // A *live* GEOSITE rule must not flip `needs_ip_resolution` —
+        // it matches domains only; upstream never resolves for it (#625).
+        let mut db = GeositeDB::empty();
+        db.insert("cn", "cn.example");
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(GeoSiteRule::new("cn", "Direct", Some(Arc::new(db)))),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+
+        let set = CompiledRuleSet::build(&rules);
+
+        assert_eq!(set.len(), 2, "live geosite category must be kept");
+        assert!(!set.needs_ip_resolution());
+    }
+
+    #[test]
+    fn geosite_beside_ip_rule_still_demands_resolution() {
+        // The GEOSITE drop must not mask a sibling's demand: aggregation is
+        // per-slot `|=` — a live IP-CIDR in the same set keeps
+        // `needs_ip_resolution` set (#625).
+        let mut db = GeositeDB::empty();
+        db.insert("cn", "cn.example");
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(GeoSiteRule::new("cn", "Direct", Some(Arc::new(db)))),
+            Box::new(IpCidrRule::new("10.0.0.0/8", "A", false, false).unwrap()),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+
+        let set = CompiledRuleSet::build(&rules);
+
+        assert_eq!(set.len(), 3);
+        assert!(
+            set.needs_ip_resolution(),
+            "the IP-CIDR sibling must still demand resolution"
+        );
+    }
+
+    #[test]
+    fn geosite_hit_lazy_scan_matches_without_enrichment() {
+        // The regression surface: a live GEOSITE slot must match on the
+        // lazy scan directly — `NeedsEnrichment` would pay a DNS resolve +
+        // strict re-run per connection (#625).
+        let mut db = GeositeDB::empty();
+        db.insert("cn", "cn.example");
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(GeoSiteRule::new("cn", "Proxy", Some(Arc::new(db)))),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        let meta = Metadata {
+            host: "cn.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                set.match_rules_lazy(&meta, &rules, &|_: &str| true),
+                LazyMatchOutcome::Matched(_)
+            ),
+            "a GEOSITE hit must return Matched, not NeedsEnrichment"
+        );
     }
 
     #[test]
@@ -3588,8 +3651,8 @@ mod tests {
         let rules: Vec<Box<dyn Rule>> = vec![
             Box::new(DomainSuffixRule::new("example.com", "Proxy")),
             Box::new(FinalRule::new("DIRECT")),
-            // Unreachable: would otherwise force DNS pre-resolution.
-            Box::new(GeoSiteRule::new("cn", "Direct", Some(Arc::new(db)), false)),
+            // Unreachable — dead-rule elimination must drop it.
+            Box::new(GeoSiteRule::new("cn", "Direct", Some(Arc::new(db)))),
         ];
 
         let set = CompiledRuleSet::build(&rules);
@@ -3736,10 +3799,8 @@ mod tests {
     #[test]
     fn never_match_geosite_rule_is_pruned() {
         let rules: Vec<Box<dyn Rule>> = vec![
-            // No DB loaded: provably never matches, but without pruning its
-            // `should_resolve_ip()` would force pre-resolution for every
-            // connection.
-            Box::new(GeoSiteRule::new("cn", "Direct", None, false)),
+            // No DB loaded: provably never matches — pruning must drop it.
+            Box::new(GeoSiteRule::new("cn", "Direct", None)),
             Box::new(FinalRule::new("DIRECT")),
         ];
 
@@ -3910,7 +3971,6 @@ mod tests {
             "microsoft@cn",
             "Direct",
             Some(Arc::new(db)),
-            false,
         ))];
 
         let set = CompiledRuleSet::build(&rules);
