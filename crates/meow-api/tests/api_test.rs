@@ -4891,6 +4891,136 @@ async fn put_configs_rebuilds_resolver_when_dns_uses_runtime_refs() {
     );
 }
 
+/// A provider payload entry this build cannot parse must not reject the
+/// candidate. The node binds a dead placeholder instead — which is what
+/// closes the fall-through-to-DIRECT hole — so one unsupported entry in a
+/// third-party feed, refetched on a timer, is not a daemon-wide kill switch
+/// in that feed operator's hands. Credentials never reach a response.
+#[tokio::test]
+async fn put_configs_trusttunnel_provider_binds_a_placeholder_instead_of_rejecting() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    let directory = tempfile::tempdir_in(
+        std::path::Path::new(state.config_path.as_deref().unwrap())
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    let bad_path = directory.path().join("bad.yaml");
+    std::fs::write(&bad_path, "proxies:\n  - {name: sibling, type: direct}\n  - {name: bad, type: trusttunnel, server: vpn.example.test, port: 443, username: fixture, password: test-only, quic: true}\n").unwrap();
+    let document = format!("mode: rule\nproxy-providers:\n  p:\n    type: file\n    path: {}\nproxy-groups:\n  - name: PROXY\n    type: select\n    use: [p]\nrules: ['MATCH,PROXY']\n", bad_path.display());
+    let response = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": base64::engine::general_purpose::STANDARD.encode(&document)})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(!body.contains("test-only"), "{body}");
+    assert!(state.tunnel.proxy("PROXY").is_some());
+
+    // The first acquisition is detached (an awaited download would stall the
+    // `CONFIG_MUTATION` lane), so wait for the payload to land.
+    let provider = Arc::clone(state.proxy_providers.get("p").unwrap().value());
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while provider.proxies().len() < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the detached acquisition must publish the fetched payload");
+    let nodes = provider.proxies();
+    let bad = nodes
+        .iter()
+        .find(|proxy| proxy.name() == "bad")
+        .expect("the unparseable node keeps its slot");
+    assert!(!bad.alive(), "a placeholder must never look usable");
+    // Listed as the type it declared, dead — not as `Reject`, which would
+    // make a misconfigured node indistinguishable from one the operator
+    // rejected on purpose in every consumer of the type: this listing, the
+    // tunnel's match statistics, and a group's dial-failure exemptions.
+    assert_eq!(
+        bad.adapter_type().to_string(),
+        "TrustTunnel",
+        "the placeholder must name the node's own type"
+    );
+    let error = bad
+        .dial_tcp(&meow_common::Metadata::default())
+        .await
+        .err()
+        .expect("a placeholder must fail the dial instead of leaking it direct")
+        .to_string();
+    assert!(error.contains("bad"), "{error}");
+    assert!(!error.contains("test-only"), "{error}");
+}
+
+/// An unavailable TrustTunnel node must fail a UDP flow closed through rule
+/// resolution, not only at `dial_udp`. The rule engine skips a UDP target
+/// that does not support UDP, and an exhausted scan dials DIRECT — so a
+/// placeholder that declined UDP sent the flow's UDP/QUIC out in the clear
+/// while the same flow's TCP failed closed: directly under `MATCH`, and
+/// through a group with nothing live to prefer over the node.
+#[tokio::test]
+async fn unavailable_trusttunnel_node_fails_udp_closed_through_rule_resolution() {
+    // Unavailable on every build: without `--features trusttunnel` the
+    // protocol is missing, and with it `fingerprint` is a TLS policy the
+    // parser refuses.
+    let node = "{name: TT, type: trusttunnel, server: vpn.example.test, port: 443, \
+                username: fixture, password: test-only, udp: true, fingerprint: '00'}";
+    for (groups, target) in [
+        ("", "TT"),
+        (
+            "proxy-groups:\n  - {name: G, type: select, proxies: [TT]}\n",
+            "G",
+        ),
+        (
+            "proxy-groups:\n  - {name: G, type: fallback, proxies: [TT]}\n",
+            "G",
+        ),
+        (
+            "proxy-groups:\n  - {name: G, type: url-test, proxies: [TT]}\n",
+            "G",
+        ),
+    ] {
+        let yaml =
+            format!("mode: rule\nproxies:\n  - {node}\n{groups}rules:\n  - MATCH,{target}\n");
+        let state = test_state(meow_config::parse_raw_yaml(&yaml).unwrap());
+        let metadata = meow_common::Metadata {
+            host: "example.test".into(),
+            dst_port: 443,
+            network: meow_common::Network::Udp,
+            ..Default::default()
+        };
+        let ResolvedTarget {
+            adapter, rule_name, ..
+        } = state.tunnel.inner().resolve_proxy(&metadata).await.unwrap();
+        assert_eq!(
+            rule_name, "MATCH",
+            "{target}: the UDP flow was skipped past the unavailable node"
+        );
+        assert_eq!(adapter.name(), target);
+        let error = adapter
+            .dial_udp(&metadata)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{target}: the UDP dial must fail closed"))
+            .to_string();
+        assert!(error.contains("TT"), "{target}: {error}");
+        assert!(!error.contains("test-only"), "{target}: {error}");
+    }
+}
+
 /// PUT /configs commits must publish the rebuilt rule-provider map into the
 /// live registry — previously only the DNS reconcile path wrote the
 /// registry, so this PUT left `GET /providers/rules` and
@@ -5704,4 +5834,72 @@ async fn put_configs_tun_fake_ip_change_restarts_listener() {
         "stop_tun must have reaped the listener slot, not just the flag"
     );
     assert!(state.tunnel.resolver().fake_ip_v4_net().is_some());
+}
+/// A newly declared provider whose origin never answers must not hold the
+/// `CONFIG_MUTATION` lane. The commit lands on its own, the initial fetch
+/// runs detached, and the next writer is not queued behind a blackholed
+/// subscription URL — the same rule that keeps ECH preresolution out of
+/// `apply_raw_to_tunnel` (issue #533 review).
+#[tokio::test]
+async fn put_configs_does_not_await_provider_downloads_in_the_mutation_lane() {
+    use base64::Engine as _;
+    use tokio::io::AsyncReadExt as _;
+    let state = test_state(test_raw_config());
+    let directory = tempfile::tempdir_in(
+        std::path::Path::new(state.config_path.as_deref().unwrap())
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = origin.local_addr().unwrap();
+    // Accept the request and then stall forever. An awaited fetch would
+    // pin the lane until the internal HTTP read timeout (60 s).
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = origin.accept().await.unwrap();
+        let mut buffer = [0; 2048];
+        let _ = stream.read(&mut buffer).await;
+        std::future::pending::<()>().await;
+    });
+    let yaml = format!(
+        "mode: rule\nproxy-providers:\n  pending:\n    type: http\n    url: http://{address}/proxies.yaml\n    proxy: front\n    path: {}\nproxy-groups: [{{name: front, type: select, proxies: [DIRECT]}}]\nrules: ['MATCH,DIRECT']\n",
+        directory.path().join("pending.yaml").display()
+    );
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/configs")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "payload": base64::engine::general_purpose::STANDARD.encode(yaml)
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        create_router(Arc::clone(&state)).oneshot(request),
+    )
+    .await
+    .expect("the commit must not wait on the provider download")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(state.proxy_providers.contains_key("pending"));
+    assert!(state.tunnel.proxy("front").is_some());
+
+    // The lane is free immediately, while that fetch is still outstanding.
+    let update = create_router(Arc::clone(&state)).oneshot(
+        Request::builder()
+            .method("PATCH")
+            .uri("/configs")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"mode":"direct"}"#))
+            .unwrap(),
+    );
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), update)
+        .await
+        .expect("CONFIG_MUTATION remained locked")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    server.abort();
 }

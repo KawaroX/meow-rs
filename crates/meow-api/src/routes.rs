@@ -1308,11 +1308,18 @@ pub fn commit_proxy_providers(
         // a newly declared name inserts fresh, and a re-declared name whose
         // definition changed carries a rebuilt provider that has never
         // fetched (issue #533 review).
-        let needs_fetch = match registry.insert(name.clone(), Arc::clone(provider)) {
-            Some(prev) => !Arc::ptr_eq(&prev, provider),
-            None => true,
-        };
-        if needs_fetch {
+        //
+        // Detached on purpose: this runs inside the `CONFIG_MUTATION` lane,
+        // where an awaited download would serialize every other commit
+        // behind one slow or blackholed provider URL — the same reason ECH
+        // preresolution is kept out of `apply_raw_to_tunnel` (issue #533
+        // review). A node this build cannot parse can no longer reject the
+        // payload (it binds an unavailable placeholder instead), so there
+        // is nothing here for a pre-commit await to gate.
+        let reused = registry
+            .insert(name.clone(), Arc::clone(provider))
+            .is_some_and(|previous| Arc::ptr_eq(&previous, provider));
+        if !reused {
             let provider = Arc::clone(provider);
             let name = name.clone();
             // `acquire_initial`, not `refresh`: a freshly committed

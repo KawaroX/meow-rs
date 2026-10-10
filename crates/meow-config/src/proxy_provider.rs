@@ -2,6 +2,7 @@ use crate::proxy_parser;
 use crate::raw::{RawHealthCheck, RawProxyProvider};
 use meow_common::atomic::AtomicU;
 use meow_common::{ProviderSlot, Proxy};
+use meow_proxy::dialer::ProxyRegistry;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -47,7 +48,7 @@ pub struct ProxyProvider {
     /// this handle is republished on every routing install, so provider
     /// nodes — which outlive individual config builds — always resolve the
     /// *current* route map, matching mihomo's by-name-at-dial-time model.
-    dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    dialer_registry: ProxyRegistry,
     /// `proxy:` — the name this provider's HTTP fetches resolve against the
     /// same republished cell at fetch time (upstream resolves the vehicle's
     /// proxy per request). `None` = direct (`proxy:` absent, empty, or
@@ -471,6 +472,7 @@ impl ProxyProvider {
     /// `loadBuf` order (`vehicle.Write` runs after `parser` succeeds), so
     /// a 200-OK garbage body can't durably poison the fallback cache.
     async fn fetch_source(&self) -> Result<String, String> {
+        let registry = &self.dialer_registry;
         match &self.vehicle {
             Vehicle::File(path) => tokio::fs::read_to_string(path).await.map_err(|e| {
                 format!(
@@ -480,7 +482,7 @@ impl ProxyProvider {
             }),
             Vehicle::Http { url, .. } => {
                 let download_proxy = match crate::internal_http::resolve_download_proxy(
-                    &self.dialer_registry,
+                    registry,
                     self.download_proxy.as_deref(),
                 ) {
                     Ok(p) => {
@@ -575,7 +577,7 @@ impl ProxyProvider {
     /// (upstream's hash early-return — `updated_at` only advances on real
     /// content changes). `from_remote` distinguishes a live fetch from an
     /// on-disk cache read — cache content is never written back.
-    async fn ingest(&self, content: String, from_remote: bool) -> Result<bool, String> {
+    async fn ingest(&self, content: String, from_remote: bool) -> Result<bool, anyhow::Error> {
         let strict = self.strict.load(Ordering::Relaxed);
         let hash = content_hash(&content);
         if *self.content_hash.lock() == Some((hash, strict)) {
@@ -598,18 +600,21 @@ impl ProxyProvider {
     /// keeps the last-good slot instead of committing an empty one. This
     /// matters now that refreshes are timer-driven: a 200-OK captive-portal
     /// page must not wipe the provider every tick. `strict` still gates
-    /// *per-node* failures only.
+    /// ordinary *per-node* failures. TT transport/policy errors always
+    /// reject the payload so a removed TT node cannot select a fallback.
     ///
     /// `declared_dialers` is rewritten only on the success path that will
     /// be committed: an `Err` keeps the last-good slot running, so it must
     /// keep that generation's declarations too (issue #489 review).
-    async fn parse_proxies(&self, content: &str) -> Result<Vec<Arc<dyn Proxy>>, String> {
+    async fn parse_proxies(&self, content: &str) -> Result<Vec<Arc<dyn Proxy>>, anyhow::Error> {
         let strict = self.strict.load(Ordering::Relaxed);
         if !crate::yaml_within_depth(content) {
-            return Err("provider YAML exceeds the nesting-depth limit".to_string());
+            return Err(anyhow::anyhow!(
+                "provider YAML exceeds the nesting-depth limit"
+            ));
         }
         let mut doc: serde_yaml::Value = serde_yaml::from_str(content)
-            .map_err(|e| format!("provider YAML is malformed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("provider YAML is malformed: {e}"))?;
         // Expand `<<:` merge keys — remote payloads legitimately carry
         // anchors, and an unexpanded merge silently drops the merged
         // `dialer-proxy` into a literal `<<` key (the one field whose loss
@@ -619,7 +624,7 @@ impl ProxyProvider {
         // drop the whole payload rather than risk nodes losing their
         // chained front hop.
         doc.apply_merge()
-            .map_err(|e| format!("provider YAML merge keys failed to expand: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("provider YAML merge keys failed to expand: {e}"))?;
 
         // Accept both `proxies: [...]` wrapper and a bare list. A
         // `Value::Null` document is an empty or comments-only file — treat
@@ -633,14 +638,14 @@ impl ProxyProvider {
 
         let mut proxy_maps: Vec<HashMap<String, serde_yaml::Value>> =
             serde_yaml::from_value(list_val)
-                .map_err(|e| format!("provider content is not a proxy list: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("provider content is not a proxy list: {e}"))?;
 
         // Pre-resolve any DNS-sourced ECH configs into inline base64 — keeps
         // `parse_proxy` itself sync. An `ech-opts.enable: true` node with no
         // query source at all is a defect — strict turns it into an error.
         crate::ech_dns::preresolve_ech(&mut proxy_maps, strict)
             .await
-            .map_err(|e| format!("{e} (strict mode)"))?;
+            .map_err(|e| anyhow::anyhow!("{e} (strict mode)"))?;
 
         let mut declared = Vec::new();
         let mut result = Vec::new();
@@ -669,12 +674,33 @@ impl ProxyProvider {
 
             match self.parse_node(raw_map, raw_name, &mut declared) {
                 Ok(proxy) => result.push(proxy),
+                Err(e) if strict => {
+                    return Err(anyhow::anyhow!(
+                        "node '{raw_name}' failed to parse (strict mode): {e}"
+                    ));
+                }
+                // Keep the slot entry as a dead placeholder instead of
+                // dropping it, so a group that lists this node can neither
+                // shift its traffic onto a sibling member nor degrade to a
+                // direct dial. Scoped to the node on purpose: this payload
+                // is third-party and refetched on a timer, so rejecting the
+                // whole feed would let its operator empty the registry on
+                // every refresh — and, for a protocol missing from this
+                // build, stop the daemon from starting at all.
+                Err(e) if proxy_parser::node_is_trusttunnel(raw_map) => {
+                    let label = if raw_name.is_empty() {
+                        "<unnamed>"
+                    } else {
+                        raw_name
+                    };
+                    warn!(provider = %self.name, proxy = label, error = %e, "keeping an unavailable trusttunnel node so nothing can dial past it");
+                    result.push(crate::unavailable_placeholder(
+                        label,
+                        &e,
+                        meow_common::AdapterType::TrustTunnel,
+                    ));
+                }
                 Err(e) => {
-                    if strict {
-                        return Err(format!(
-                            "node '{raw_name}' failed to parse (strict mode): {e}"
-                        ));
-                    }
                     warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
                 }
             }
@@ -848,7 +874,7 @@ impl ProxyProvider {
                     // A torn payload keeps the last-good set instead of
                     // replacing it with nothing.
                     warn!(provider = %self.name, error = %e, "proxy-provider refresh failed");
-                    Err(e)
+                    Err(e.to_string())
                 }
             },
             Err(e) => {
@@ -858,17 +884,15 @@ impl ProxyProvider {
         }
     }
 
-    /// First acquisition for a freshly built provider — startup and the
-    /// detached post-commit fetch. Unlike [`Self::refresh`] this DOES fall
-    /// back to the on-disk cache when the remote is unreachable (offline
-    /// bootstrap); the slot is empty at this point, so last-good
-    /// retention is moot.
-    pub async fn acquire_initial(&self) -> Result<(), String> {
+    /// Initial acquisition, with HTTP cache fallback.
+    ///
+    /// Holds `refresh_lock` across fetch+parse+swap: two overlapping
+    /// acquisitions could otherwise interleave `slot` / derived views /
+    /// `declared_dialers` from different payloads.
+    pub async fn acquire_initial(&self) -> anyhow::Result<()> {
         let _generation = self.refresh_lock.lock().await;
-        match self.fetch_content().await {
-            Ok((content, from_remote)) => self.ingest(content, from_remote).await.map(|_| ()),
-            Err(e) => Err(e),
-        }
+        let (content, from_remote) = self.fetch_content().await.map_err(anyhow::Error::msg)?;
+        self.ingest(content, from_remote).await.map(|_| ())
     }
 
     /// Consumes the deferred-initial-fetch flag: `true` once per provider
@@ -970,7 +994,13 @@ pub async fn load_proxy_providers(
                         Err(e) => warn_initial_load_failure(&provider, &e),
                     }
                 } else if let Err(e) = provider.acquire_initial().await {
-                    warn_initial_load_failure(&provider, &e);
+                    // Lenient keeps the payload's usable nodes and binds the
+                    // rest to unavailable placeholders, so only a defect that
+                    // stops the *whole* payload from parsing lands here. This
+                    // feed is third-party and refetched on a timer: rejecting
+                    // it wholesale would hand its operator a daemon-wide kill
+                    // switch that re-fires on every tick.
+                    warn_initial_load_failure(&provider, &e.to_string());
                 }
                 result.insert(name.clone(), provider);
             }
@@ -2468,6 +2498,58 @@ header:
         registry
     }
 
+    /// A node this build cannot parse costs exactly that node: the rest of
+    /// the payload still loads, and the bad entry stays in the slot as a
+    /// dead placeholder so a `use:` group can neither quietly shrink nor,
+    /// once it is the only member left, degrade to a direct dial. Rejecting
+    /// the payload instead would let the feed's operator empty the registry
+    /// on every refresh tick.
+    #[tokio::test]
+    async fn unparseable_node_becomes_a_dead_placeholder_not_a_payload_rejection() {
+        let url = spawn_payload_server(
+            "proxies:\n  - {name: good, type: direct}\n  - {name: bad, type: trusttunnel, server: vpn.example.test, port: 443, username: fixture, password: test-only, quic: true}\n",
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ProxyProvider::new(
+            "p",
+            &raw_http_provider(&url, None),
+            Some(dir.path()),
+            false,
+            false,
+            ProxyRegistry::default(),
+        )
+        .unwrap();
+        provider
+            .acquire_initial()
+            .await
+            .expect("one bad node must not reject the whole payload");
+
+        let nodes = provider.proxies();
+        assert_eq!(nodes.len(), 2, "the bad node keeps its slot entry");
+        let bad = nodes
+            .iter()
+            .find(|proxy| proxy.name() == "bad")
+            .expect("the unparseable node stays addressable by name");
+        assert!(!bad.alive(), "a placeholder must never look usable");
+        assert!(
+            bad.dial_tcp(&meow_common::Metadata::default())
+                .await
+                .is_err(),
+            "a placeholder must fail the dial instead of leaking it direct"
+        );
+        // The credential fields of the rejected node must not reach the
+        // diagnostic the placeholder renders into every dial error.
+        let error = bad
+            .dial_tcp(&meow_common::Metadata::default())
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("bad"), "{error}");
+        assert!(!error.contains("test-only"), "{error}");
+    }
+
     /// `proxy: <name>` routes the provider fetch through that registry
     /// entry — the dial lands on the named hop, not on a direct socket.
     #[tokio::test]
@@ -2526,7 +2608,7 @@ header:
         // cache exists — the resolution failure itself still flagged the
         // deferred retry inside `fetch_source`.
         assert!(
-            err.contains("cache") || err.contains("'front'"),
+            err.to_string().contains("cache") || err.to_string().contains("'front'"),
             "unexpected: {err}"
         );
         assert!(p.proxies().is_empty());
