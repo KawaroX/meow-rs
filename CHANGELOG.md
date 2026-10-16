@@ -10,6 +10,15 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **Inbound-supplied process identity for embedders**:
+  `meow_common::process_lookup::enable_inbound_process_info()` declares that
+  the embedder's inbound fills `Metadata::process` / `process_path` / `uid`
+  before dispatch. PROCESS-NAME, PROCESS-PATH and UID rules then stay live on
+  platforms without a native process lookup (Android) and match those fields
+  as supplied, so an Android VPN that resolves each flow's owner through
+  `ConnectivityManager.getConnectionOwnerUid` can route by package name or
+  app uid. Default behaviour is unchanged.
+
 - Opt-in TrustTunnel client outbound (`--features trusttunnel`):
   authenticated CONNECT, TCP half-close, bounded pooling and IPv4/IPv6 UDP
   multiplexing over HTTP/2, plus the specification's per-stream `user-agent`
@@ -26,6 +35,11 @@ the canonical, in-repo source a release is cut from.
   x86 OpenWrt.
 
 ### Fixed
+
+- **`/connections` reports the app that opened a flow**: `metadata.process`,
+  `processPath` and `uid` were blanked when a connection was registered, so
+  an inbound that supplies them (an Android VPN) never showed the owner.
+  They are now kept, as in mihomo.
 
 - **`/connections` shows the node a group actually uses**: a flow whose
   rule targets a proxy group now records every group's selected member in
